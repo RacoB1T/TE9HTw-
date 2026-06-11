@@ -16,3 +16,4 @@ data/test_20_processed
 data/test_20_raw.json
 model
 output
+*.md
