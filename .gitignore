@@ -9,3 +9,10 @@ evaluation/LongPPL/results
 *.pyc
 *.sh
 evaluation/longbench/scripts/
+data/long
+data/gpt
+data/longalpaca
+data/test_20_processed
+data/test_20_raw.json
+model
+output
