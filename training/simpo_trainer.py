@@ -52,14 +52,28 @@ class SimPOTrainer(Trainer):
         load_from_cache_path = kwargs.pop("load_from_cache_path", False)
         cache_path = kwargs.pop("cache_path", None)
 
+        # --- Transformers 5.x compat: keep custom data columns alive ---
+        if getattr(args, "remove_unused_columns", True):
+            logger.warning(
+                "Setting remove_unused_columns=False — LOGO datasets carry "
+                "custom fields (chosen_input_ids, reject_1_*, …) that are "
+                "not in the model forward() signature and would otherwise "
+                "be dropped."
+            )
+            args.remove_unused_columns = False
+
+        # --- Transformers 5.x compat: Trainer uses processing_class ---
         super().__init__(
             model=model,
             args=args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
+            processing_class=tokenizer,
             data_collator=data_collator,
         )
+
+        # Keep a .tokenizer alias for subclasses that reference it directly.
+        self.tokenizer = tokenizer
 
         # --- SimPO hyperparameters ---
         self.beta = getattr(args, "beta", 2.0)
@@ -118,14 +132,22 @@ class SimPOTrainer(Trainer):
 
     @staticmethod
     def disable_dropout(model: torch.nn.Module) -> None:
-        """Set all dropout modules in *model* to eval mode (dropout disabled).
+        """Permanently set dropout probability to 0 for all Dropout modules.
 
-        Called automatically when ``--disable_dropout`` is set (the LOGO
-        default)."""
+        Using ``module.eval()`` is **not** sufficient — the Trainer calls
+        ``model.train()`` at the start of training, which recursively
+        re-enables every sub-module's training mode (and thus dropout).
+
+        Setting ``module.p = 0.0`` survives ``model.train()``.
+        """
         for module in model.modules():
             if isinstance(module, torch.nn.Dropout):
-                module.eval()
-        logger.info("Dropout has been disabled for all Dropout modules.")
+                module.p = 0.0
+
+        logger.info(
+            "Dropout probability has been set to 0.0 "
+            "for all Dropout modules."
+        )
 
     @staticmethod
     def get_batch_logps(
@@ -135,7 +157,11 @@ class SimPOTrainer(Trainer):
         is_encoder_decoder: bool = False,
         label_pad_token_id: int = -100,
     ) -> torch.FloatTensor:
-        """Compute per-token log-probabilities and (optionally) average them.
+        """Compute per-token log-probabilities for causal LMs.
+
+        For decoder-only models the standard shift is applied:
+            logits[t]  predicts  labels[t+1]
+        so we drop the last logit position and the first label position.
 
         Parameters
         ----------
@@ -143,40 +169,52 @@ class SimPOTrainer(Trainer):
         labels : (batch, seq_len)
         average_log_prob : bool
             If True, return the *average* log-probability across non-padding
-            tokens. If False, sum across tokens.
+            tokens. If False, return the sum.
         is_encoder_decoder : bool
-            Unused in LOGO; kept for API compatibility.
+            If True, the shift is skipped (encoder-decoder models produce
+            logits that are already aligned with labels).
         label_pad_token_id : int
-            Token id to ignore (default -100).
+            Token id used for padding / masking (default -100).
 
         Returns
         -------
-        logps : (batch,)  if average_log_prob=True
-                (batch,)  if average_log_prob=False (sum)
+        logps : (batch,)  — averaged or summed per sequence.
         """
-        # Sanity: alignment
         if logits.shape[:-1] != labels.shape:
             raise ValueError(
-                f"Shape mismatch: logits {logits.shape[:-1]} vs labels {labels.shape}"
+                f"Shape mismatch: logits {logits.shape[:-1]} "
+                f"vs labels {labels.shape}"
             )
 
         labels = labels.to(logits.device)
 
+        # ---- causal LM shift ----
+        if not is_encoder_decoder:
+            labels = labels[:, 1:].clone()
+            logits = logits[:, :-1, :]
+
+        # ---- build a mask BEFORE touching the labels ----
         loss_mask = labels != label_pad_token_id
 
-        # Per-token log-probability using log-softmax
+        # Replace pad tokens with a safe index (0) so gather never sees -100.
+        safe_labels = labels.masked_fill(~loss_mask, 0)
+
         per_token_logps = torch.gather(
             logits.log_softmax(dim=-1),
             dim=-1,
-            index=labels.unsqueeze(-1),
-        ).squeeze(-1)  # (batch, seq_len)
+            index=safe_labels.unsqueeze(-1),
+        ).squeeze(-1)  # (batch, seq_len-1)
+
+        # Zero-out positions that are padding
+        per_token_logps = per_token_logps * loss_mask
+
+        sequence_logps = per_token_logps.sum(dim=-1)
 
         if average_log_prob:
-            return (per_token_logps * loss_mask).sum(dim=-1) / loss_mask.sum(
-                dim=-1
-            ).clamp(min=1e-8)
-        else:
-            return (per_token_logps * loss_mask).sum(dim=-1)
+            token_counts = loss_mask.sum(dim=-1).clamp(min=1)
+            sequence_logps = sequence_logps / token_counts
+
+        return sequence_logps
 
     # ------------------------------------------------------------------
     #  HuggingFace Trainer hooks

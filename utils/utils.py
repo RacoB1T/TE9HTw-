@@ -176,6 +176,17 @@ def _apply_lora(
 ) -> PreTrainedModel:
     peft_model_path = getattr(model_args, "peft_model_path", None)
 
+    # Parse trainable parameter keywords early — needed for both paths.
+    trainable_names = [
+        name.strip()
+        for name in getattr(
+            training_args,
+            "trainable_params",
+            "embed, norm",
+        ).split(",")
+        if name.strip()
+    ]
+
     if peft_model_path:
         logger.info(
             "Load trainable PEFT adapter from %s",
@@ -188,32 +199,38 @@ def _apply_lora(
             is_trainable=True,
         )
     else:
+        # Discover modules to save alongside the LoRA adapter.
+        # These are non-LoRA parameters (embed_tokens, norm, layernorms)
+        # that the LOGO paper trains. Without modules_to_save, PEFT
+        # would silently drop their updated weights on save_pretrained().
+        modules_to_save: List[str] = []
+        for module_name, _module in model.named_modules():
+            if any(key in module_name for key in trainable_names):
+                modules_to_save.append(module_name)
+
         lora_config = LoraConfig(
             r=int(getattr(model_args, "lora_r", 32)),
             lora_alpha=int(
                 getattr(model_args, "lora_alpha", 16)
             ),
             target_modules=ATTENTION_LORA_TARGETS,
+            modules_to_save=modules_to_save if modules_to_save else None,
             lora_dropout=0.0,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
         )
 
-        logger.info("LoRA configuration: %s", lora_config)
+        logger.info(
+            "LoRA configuration: %s  |  modules_to_save (%d): %s",
+            lora_config,
+            len(modules_to_save),
+            modules_to_save,
+        )
         model = get_peft_model(model, lora_config)
 
-    # 仓库 TrainingArguments 默认是 "embed, norm"。
-    # 即除 LoRA 参数外，Embedding 和归一化层也参加训练。
-    trainable_names = [
-        name.strip()
-        for name in getattr(
-            training_args,
-            "trainable_params",
-            "embed, norm",
-        ).split(",")
-        if name.strip()
-    ]
-
+    # Additionally unfreeze any remaining parameters that match the
+    # trainable keywords but were not picked up by modules_to_save
+    # (e.g. parameters inside saved modules are already trainable).
     for parameter_name, parameter in model.named_parameters():
         if any(key in parameter_name for key in trainable_names):
             parameter.requires_grad_(True)

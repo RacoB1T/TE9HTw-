@@ -116,8 +116,13 @@ class InstructTuningDataCollator(BasicDataCollator):
 
 
 class SimPODataCollator(BasicDataCollator):
-    def filter_fun(self, x):
+    def filter_fun(self, key):
         return True
+
+    @staticmethod
+    def _is_label_key(key: str) -> bool:
+        """Detect label fields that should be padded with -100."""
+        return key == "labels" or key.endswith("_labels")
 
     def __call__(self, batch):
         wrap_batch = {}
@@ -126,11 +131,29 @@ class SimPODataCollator(BasicDataCollator):
         if isinstance(batch[0][keys[0]], list):
             for key in keys:
                 if self.filter_fun(key):
-                    wrap_batch[key] = torch.stack([self.auto_cut_length(torch.tensor(batch[i][key])) for i in range(batch_size)])
+                    is_label = self._is_label_key(key)
+                    wrap_batch[key] = torch.stack(
+                        [
+                            self.auto_cut_length(
+                                torch.tensor(batch[i][key]),
+                                is_label=is_label,
+                            )
+                            for i in range(batch_size)
+                        ]
+                    )
         else:
             for key in keys:
                 if self.filter_fun(key):
-                    wrap_batch[key] = torch.stack([self.auto_cut_length(batch[i][key]) for i in range(batch_size)])
+                    is_label = self._is_label_key(key)
+                    wrap_batch[key] = torch.stack(
+                        [
+                            self.auto_cut_length(
+                                batch[i][key],
+                                is_label=is_label,
+                            )
+                            for i in range(batch_size)
+                        ]
+                    )
         return wrap_batch
 
 
