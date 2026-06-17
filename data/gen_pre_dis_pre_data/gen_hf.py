@@ -119,19 +119,26 @@ def merge_chat_item(item, model_type, tokenizer, concate_str=' \n ', meta_info=N
             c_lst = sorted(c_lst[num_save_chunks:], key=lambda x: x['chunk_id'])
         else:
             c_lst = sorted(c_lst[:num_save_chunks], key=lambda x: x['chunk_id'])
-        c_lst = [chunk['chunk'] for chunk in c_lst]
-        context = concate_str.join(c_lst)
-        prompt = [{'role': 'user', 'content': f'Answer the question according to the context below:\n{context}\n Question: {q}'}]
-        # chat_prompt = tokenizer.apply_chat_template(conversation=prompt, tokenize=False, 
-        # add_generation_prompt=True)
+        # Preserve chunk_id alongside text
+        context_chunks = [
+            {"chunk_id": chunk['chunk_id'], "text": chunk['chunk']}
+            for chunk in c_lst
+        ]
+        context_text = concate_str.join(chunk['chunk'] for chunk in c_lst)
+        prompt = [{'role': 'user', 'content': f'Answer the question according to the context below:\n{context_text}\n Question: {q}'}]
         chat_prompt = apply_chat_template(
-            model_type, 
+            model_type,
             messages=prompt,
             tokenizer=tokenizer,
             add_generation_prompt=True,
         ).raw
-        # fastchat template
-        all_merged_res.append({'prompt': chat_prompt, 'context_lst': c_lst, 'question': q, 'label': a, 'meta_info': meta_info})
+        all_merged_res.append({
+            'prompt': chat_prompt,
+            'context_lst': context_chunks,
+            'question': q,
+            'label': a,
+            'meta_info': meta_info,
+        })
     return all_merged_res
 
 

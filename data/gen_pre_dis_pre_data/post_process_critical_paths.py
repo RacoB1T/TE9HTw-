@@ -97,38 +97,34 @@ class PostProcessor:
     
     
     def process_chunk(self, data_chunk):
-        partial_result = dict(all_ref_text = [], combined_question = [], final_answer = [], label = [], prefix_a = [], siffix_a = [])
+        partial_result = dict(
+            all_ref_text=[], combined_question=[], final_answer=[],
+            label=[], prefix_a=[], suffix_a=[],
+            critical_chunks=[], partial_critical_chunks=[], irrelevant_chunks=[],
+        )
         with tqdm(total=len(data_chunk), desc=f'Processing chunk, PID is {os.getpid()}') as pbar:
             for item1, item2, item3 in data_chunk:
                 if item1['question'] == item2['question'] and item1['question'] == item3['question']:
-                    if item1['question'] == item2['question'] and item1['question'] == item3['question']:
-                        judge_score = -1 
-                        judge_res, judge_res_str = None, None
-                       
-                        if judge_res is None:
-                            judge_score = -1
-                        else:
-                            if judge_res[-1]:  
-                                if all(judge_res[:2]) or not all(judge_res[:2]):  
-                                    judge_score = 1
-                                elif judge_res[0] and not judge_res[1]: 
-                                    judge_score = 2
-                                else:
-                                    judge_score = 0
-                            else:
-                                judge_score = 0
-                        partial_result['combined_question'].append(item1['question'])
-                        partial_result['label'].append(item1['label'])
-                        partial_result['final_answer'].append(item1['predict'])
-                        partial_result['prefix_a'].append(item2['predict'])
-                        partial_result['siffix_a'].append(item3['predict'])
-                        partial_result['all_ref_text'].append(item1['context_lst'])
+                    partial_result['combined_question'].append(item1['question'])
+                    partial_result['label'].append(item1['label'])
+                    partial_result['final_answer'].append(item1['predict'])
+                    partial_result['prefix_a'].append(item2['predict'])
+                    partial_result['suffix_a'].append(item3['predict'])
+                    partial_result['all_ref_text'].append(item1['context_lst'])
+                    # Preserve chunk-level context for paper mode
+                    partial_result['critical_chunks'].append(item1.get('context_lst', []))
+                    partial_result['partial_critical_chunks'].append(item2.get('context_lst', []))
+                    partial_result['irrelevant_chunks'].append(item3.get('context_lst', []))
                 pbar.update(1)
         return partial_result
-    
-    
+
+
     def merge_results(self, results):
-        final_result = dict(all_ref_text = [], combined_question = [], final_answer = [], label = [], prefix_a = [], siffix_a = [])
+        final_result = dict(
+            all_ref_text=[], combined_question=[], final_answer=[],
+            label=[], prefix_a=[], suffix_a=[],
+            critical_chunks=[], partial_critical_chunks=[], irrelevant_chunks=[],
+        )
         for result in results:
             for key in final_result:
                 final_result[key].extend(result[key])
@@ -162,46 +158,30 @@ class PostProcessor:
 
         
     def sp_process_dataset(self, dataset_name, save_path):
-        '''single process dataset'''
+        '''single process dataset (legacy; prefer mp_process_dataset).'''
         all_samples = self.datasets[dataset_name]
         merged_data = dict(
-            all_ref_text = [],
-            combined_question = [],
-            final_answer = [],
-            label = [],
-            prefix_a = [],
-            siffix_a = [], 
-            judge_scores = [],
-            judger_preds = []
+            all_ref_text=[], combined_question=[], final_answer=[],
+            label=[], prefix_a=[], suffix_a=[],
+            critical_chunks=[], partial_critical_chunks=[], irrelevant_chunks=[],
         )
         pred_w_full_paths = all_samples['pred_w_full_paths']
         pred_w_half_paths = all_samples['pred_w_half_paths']
         pred_wo_critical_paths = all_samples['pred_wo_critical_paths']
-        with tqdm(total=len(pred_w_full_paths), desc=f'Processing {dataset_name}, which has {len(merged_data["judge_scores"])} items') as pbar:
+        with tqdm(total=len(pred_w_full_paths), desc=f'Processing {dataset_name}') as pbar:
             for item1, item2, item3 in zip(pred_w_full_paths, pred_w_half_paths, pred_wo_critical_paths):
                 if item1['question'] == item2['question'] and item1['question'] == item3['question']:
-                    judge_score = -1  
-                    judge_res = None
-                    if judge_res is None:
-                        judge_score = -1
-                    else:
-                        if judge_res[-1]:  
-                            if all(judge_res[:2]) or not all(judge_res[:2]): 
-                                judge_score = 1
-                            elif judge_res[0] and not judge_res[1]: 
-                                judge_score = 2
-                            else:
-                                judge_score = 0
-                        else:
-                            judge_score = 0
                     merged_data['combined_question'].append(item1['question'])
                     merged_data['label'].append(item1['label'])
                     merged_data['final_answer'].append(item1['predict'])
                     merged_data['prefix_a'].append(item2['predict'])
-                    merged_data['siffix_a'].append(item3['predict'])
+                    merged_data['suffix_a'].append(item3['predict'])
                     merged_data['all_ref_text'].append(item1['context_lst'])
+                    merged_data['critical_chunks'].append(item1.get('context_lst', []))
+                    merged_data['partial_critical_chunks'].append(item2.get('context_lst', []))
+                    merged_data['irrelevant_chunks'].append(item3.get('context_lst', []))
                 pbar.update(1)
-        print(f'judge dataset: {dataset_name} finish... has length', len(merged_data))
+        print(f'judge dataset: {dataset_name} finish... has length', len(merged_data['combined_question']))
         Dataset.from_dict(merged_data).save_to_disk(save_path)
 
 
