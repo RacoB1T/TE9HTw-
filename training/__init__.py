@@ -1,0 +1,1 @@
+# LOGO training package

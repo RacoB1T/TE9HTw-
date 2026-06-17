@@ -10,7 +10,11 @@ from typing import List, Any, Dict, Union, Tuple
 
 import numpy as np
 from copy import deepcopy
-from transformers.tokenization_utils import PreTrainedTokenizer, BatchEncoding
+from transformers.tokenization_utils import PreTrainedTokenizer
+try:
+    from transformers import BatchEncoding
+except ImportError:
+    from transformers.tokenization_utils import BatchEncoding
 
 
 @dataclasses.dataclass

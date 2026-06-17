@@ -6,7 +6,8 @@ import torch
 import logging
 import torch.nn.functional as F
 from modelzipper.tutils import *
-from typing import List, Tuple, Union, Literal, Dict
+from dataclasses import dataclass, field
+from typing import List, Tuple, Union, Literal, Dict, Optional
 from datasets import load_dataset, load_from_disk
 from peft import LoraConfig, get_peft_model, PeftModelForCausalLM
 from transformers import (AutoTokenizer, HfArgumentParser, set_seed, TrainingArguments, AutoConfig)
@@ -81,6 +82,14 @@ class SimORPOTrainer(SimPOTrainer):
 
     def concatenated_forward(self, model, batch): # one chosen, two rejected
         len_chosen = batch['chosen_input_ids'].size(0)
+
+        if len_chosen != 1:
+            raise ValueError(
+                f"Current LOGO implementation requires per_device_train_batch_size=1, "
+                f"but got batch size {len_chosen}. The labels[index] comparison logic "
+                f"in concatenated_forward assumes exactly one sample per batch."
+            )
+
         concatenated_batch = self.move_to_device(batch, device=self.accelerator.device)
 
         input_ids = torch.concatenate([
@@ -123,37 +132,42 @@ class SimORPOTrainer(SimPOTrainer):
         )
         
         chosen_logps = all_logps[:len_chosen]
-        prefix_chosen_logps = all_logps[len_chosen:len_chosen*2]
-        suffix_chosen_logps = all_logps[len_chosen:]
+        prefix_chosen_logps = all_logps[len_chosen:len_chosen * 2]
+        suffix_chosen_logps = all_logps[len_chosen * 2:]
         chosen_logits = all_logits[:len_chosen]
-        prefix_chosen_logits = all_logits[len_chosen:len_chosen*2]
-        suffix_chosen_logits = all_logits[len_chosen*2:]
+        prefix_chosen_logits = all_logits[len_chosen:len_chosen * 2]
+        suffix_chosen_logits = all_logits[len_chosen * 2:]
 
-        return (chosen_logps, 
-                prefix_chosen_logps, 
-                suffix_chosen_logps, 
-                chosen_logits, 
-                prefix_chosen_logits, 
+        return (chosen_logps,
+                prefix_chosen_logps,
+                suffix_chosen_logps,
+                chosen_logits,
+                prefix_chosen_logits,
                 suffix_chosen_logits, )
 
     def get_batch_loss_metrics(self, model, batch, train_eval):
         """Compute the SimPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
         prefix = "eval_" if train_eval == "eval" else ""
-        
+
         policy_chosen_logps, policy_rejected_logps1, policy_rejected_logps2, policy_chosen_logits, policy_rejected_logits1, policy_rejected_logits2 = self.concatenated_forward(model, batch)
-        
+
         losses, chosen_rewards, rejected_rewards = self.simpo_loss(policy_chosen_logps, (policy_rejected_logps1 + policy_rejected_logps2) / 2)
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
         loss = losses.mean()
 
         if self.sft_weight > 0.0:
-            loss_func = nn.CrossEntropyLoss() # method 2
-            sft_loss = loss_func(policy_chosen_logits.view(-1, policy_chosen_logits.shape[-1]), batch["chosen_labels"].view(-1))
-            loss = self.sft_weight * sft_loss + loss
+            shift_logits = policy_chosen_logits[..., :-1, :].contiguous()
+            shift_labels = batch["chosen_labels"][..., 1:].contiguous().to(shift_logits.device)
+            sft_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=self.label_pad_token_id,
+            )
+            loss = loss + self.sft_weight * sft_loss
             metrics[f"{prefix}sft_loss"] = sft_loss.detach().cpu()
-    
+
         metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
         metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu()
         metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
@@ -196,6 +210,14 @@ class LOGOTrainer(SimPOTrainer):
 
     def concatenated_forward(self, model, batch): # one chosen, two rejected
         len_chosen = batch['chosen_input_ids'].size(0)
+
+        if len_chosen != 1:
+            raise ValueError(
+                f"Current LOGO implementation requires per_device_train_batch_size=1, "
+                f"but got batch size {len_chosen}. The labels[index] comparison logic "
+                f"in concatenated_forward assumes exactly one sample per batch."
+            )
+
         concatenated_batch = self.move_to_device(batch, device=self.accelerator.device)
 
         input_ids = torch.concatenate([
@@ -243,37 +265,42 @@ class LOGOTrainer(SimPOTrainer):
         )
         
         chosen_logps = all_logps[:len_chosen]
-        prefix_chosen_logps = all_logps[len_chosen:len_chosen*2]
-        suffix_chosen_logps = all_logps[len_chosen:]
+        prefix_chosen_logps = all_logps[len_chosen:len_chosen * 2]
+        suffix_chosen_logps = all_logps[len_chosen * 2:]
         chosen_logits = all_logits[:len_chosen]
-        prefix_chosen_logits = all_logits[len_chosen:len_chosen*2]
-        suffix_chosen_logits = all_logits[len_chosen*2:]
+        prefix_chosen_logits = all_logits[len_chosen:len_chosen * 2]
+        suffix_chosen_logits = all_logits[len_chosen * 2:]
 
-        return (chosen_logps, 
-                prefix_chosen_logps, 
-                suffix_chosen_logps, 
-                chosen_logits, 
-                prefix_chosen_logits, 
+        return (chosen_logps,
+                prefix_chosen_logps,
+                suffix_chosen_logps,
+                chosen_logits,
+                prefix_chosen_logits,
                 suffix_chosen_logits, )
 
     def get_batch_loss_metrics(self, model, batch, train_eval):
         """Compute the SimPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
         prefix = "eval_" if train_eval == "eval" else ""
-        
+
         policy_chosen_logps, policy_rejected_logps1, policy_rejected_logps2, policy_chosen_logits, policy_rejected_logits1, policy_rejected_logits2 = self.concatenated_forward(model, batch)
-        
+
         losses, chosen_rewards, rejected_rewards = self.simpo_loss(policy_chosen_logps, (policy_rejected_logps1 + policy_rejected_logps2) / 2)
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
         loss = losses.mean()
 
         if self.sft_weight > 0.0:
-            loss_func = nn.CrossEntropyLoss() # method 2
-            sft_loss = loss_func(policy_chosen_logits.view(-1, policy_chosen_logits.shape[-1]), batch["chosen_labels"].view(-1))
-            loss = self.sft_weight * sft_loss + loss
+            shift_logits = policy_chosen_logits[..., :-1, :].contiguous()
+            shift_labels = batch["chosen_labels"][..., 1:].contiguous().to(shift_logits.device)
+            sft_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=self.label_pad_token_id,
+            )
+            loss = loss + self.sft_weight * sft_loss
             metrics[f"{prefix}sft_loss"] = sft_loss.detach().cpu()
-    
+
         metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
         metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu()
         metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()

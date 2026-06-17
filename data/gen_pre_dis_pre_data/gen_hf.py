@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests, os
 from modelzipper.tutils import *
 import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'evaluation')))
 from chat import apply_chat_template
 
 tqdm.pandas()

@@ -1,0 +1,38 @@
+# =============================================================================
+# LOGO Training Dependencies
+# =============================================================================
+# Install: pip install -r requirements.txt
+#
+# Core: the versions below match the scriptcare conda environment.
+# The SimPO / DPO trainer patterns originate from earlier Transformers
+# releases; forward-compatibility has been handled in simpo_trainer.py.
+# =============================================================================
+
+# --- Core ML stack ---
+torch>=2.0.0,<3.0.0
+transformers>=4.40.0,<6.0.0
+peft>=0.10.0,<1.0.0
+accelerate>=0.28.0,<2.0.0
+datasets>=2.16.0,<6.0.0
+
+# --- Distributed training ---
+deepspeed>=0.14.0,<1.0.0
+
+# --- Data processing ---
+numpy>=1.24.0
+dill>=0.3.7
+tqdm>=4.66.0
+requests>=2.31.0
+
+# --- Custom dependency (not on PyPI; must be installed from source) ---
+# modelzipper  --  provides modelzipper.tutils (auto_read_data, etc.)
+# Install from the author's repository or local wheel.
+
+# --- Optional: data generation pipeline ---
+# vllm>=0.5.0          # inference server for gen_hf.py
+# nltk>=3.8            # ImportanceScoring.py
+# spacy>=3.7           # ImportanceScoring.py
+# fire>=0.5.0          # post_process_critical_paths.py
+
+# --- Optional: evaluation ---
+# sentencepiece>=0.2.0 # some tokenizers require it
