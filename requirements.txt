@@ -2,37 +2,47 @@
 # LOGO Training Dependencies
 # =============================================================================
 # Install: pip install -r requirements.txt
-#
-# Core: the versions below match the scriptcare conda environment.
-# The SimPO / DPO trainer patterns originate from earlier Transformers
-# releases; forward-compatibility has been handled in simpo_trainer.py.
 # =============================================================================
 
-# --- Core ML stack ---
-torch>=2.0.0,<3.0.0
-transformers>=4.40.0,<6.0.0
-peft>=0.10.0,<1.0.0
-accelerate>=0.28.0,<2.0.0
-datasets>=2.16.0,<6.0.0
+# --- Core ML stack (pinned for reproducibility) ---
+torch>=2.4.0,<3.0.0
+transformers>=5.0.0,<6.0.0        # simpo_trainer.py uses processing_class (5.x API)
+peft>=0.12.0,<1.0.0
+accelerate>=0.34.0,<2.0.0
+datasets>=2.20.0,<6.0.0
 
 # --- Distributed training ---
 deepspeed>=0.14.0,<1.0.0
+
+# --- FlashAttention (required for long-context training) ---
+flash-attn>=2.6.0
 
 # --- Data processing ---
 numpy>=1.24.0
 dill>=0.3.7
 tqdm>=4.66.0
 requests>=2.31.0
+openai>=1.0.0                      # for utils.call_llm_api (OpenAI-compatible client)
 
-# --- Custom dependency (not on PyPI; must be installed from source) ---
-# modelzipper  --  provides modelzipper.tutils (auto_read_data, etc.)
-# Install from the author's repository or local wheel.
+# =============================================================================
+# Custom dependency (NOT on PyPI — must be installed from source)
+# =============================================================================
+# modelzipper  --  provides modelzipper.tutils (colored, print_c, load_jsonl, etc.)
+#
+#   pip install git+https://github.com/ZetangForward/ZipCode.git
+#
+# If modelzipper's auto_read_data is unavailable, a fallback in
+# utils.utils.auto_read_data handles JSON / JSONL / Parquet / HF Dataset loading.
 
-# --- Optional: data generation pipeline ---
-# vllm>=0.5.0          # inference server for gen_hf.py
-# nltk>=3.8            # ImportanceScoring.py
-# spacy>=3.7           # ImportanceScoring.py
-# fire>=0.5.0          # post_process_critical_paths.py
+# =============================================================================
+# Optional: data generation pipeline
+# =============================================================================
+# vllm>=0.5.0          # inference server for gen_hf.py (use guarded import)
+# nltk>=3.8            # ImportanceScoring.py sentence tokenization
+# spacy>=3.7           # ImportanceScoring.py NER-based path extraction
+# fire>=0.5.0          # post_process_critical_paths.py CLI
 
-# --- Optional: evaluation ---
+# =============================================================================
+# Optional: evaluation
+# =============================================================================
 # sentencepiece>=0.2.0 # some tokenizers require it

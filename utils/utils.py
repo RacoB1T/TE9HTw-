@@ -148,6 +148,7 @@ def _load_base_model(
     model_name_or_path: str,
     config: Any,
     training_args: Any,
+    model_args: Any = None,
 ) -> PreTrainedModel:
     load_kwargs = {
         "config": config,
@@ -156,6 +157,12 @@ def _load_base_model(
         # 使用 DeepSpeed 时不要设置 device_map="auto"。
         "low_cpu_mem_usage": True,
     }
+
+    # FlashAttention-2 / SDPA / eager
+    attn_impl = getattr(model_args, "attn_implementation", None)
+    if attn_impl is not None:
+        load_kwargs["attn_implementation"] = attn_impl
+        logger.info("Using attn_implementation=%s", attn_impl)
 
     torch_dtype = _get_torch_dtype(training_args)
     if torch_dtype is not None:
@@ -337,6 +344,7 @@ def create_and_prepare_model(
         model_name_or_path=model_name_or_path,
         config=config,
         training_args=training_args,
+        model_args=model_args,
     )
 
     # 只有新增了 pad token 时才需要扩展词表。
@@ -359,3 +367,77 @@ def create_and_prepare_model(
     _print_trainable_parameters(model)
 
     return model, tokenizer
+
+
+# ---------------------------------------------------------------------------
+# Data loading fallback (modelzipper.tutils.auto_read_data may be missing)
+# ---------------------------------------------------------------------------
+
+def auto_read_data(path: str) -> Any:
+    """Load a dataset from *path*, supporting common formats.
+
+    Tries (in order):
+    1. HuggingFace ``datasets.load_from_disk``
+    2. JSON array
+    3. JSONL (one JSON object per line)
+    4. ``datasets.load_dataset`` with parquet / json / csv
+
+    This is a drop-in replacement for ``modelzipper.tutils.auto_read_data``
+    when that function is unavailable.
+    """
+    import json
+    import os
+
+    # 1. HuggingFace Dataset directory
+    if os.path.isdir(path):
+        try:
+            import datasets
+            ds = datasets.load_from_disk(path)
+            return ds
+        except Exception:
+            pass
+
+    # 2. JSON file
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+    # 3. JSONL file
+    if os.path.isfile(path):
+        try:
+            records = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+            if records:
+                return records
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+    # 4. Generic datasets loader (parquet / json / csv)
+    try:
+        import datasets
+        ds = datasets.load_dataset(
+            "json" if path.endswith(".json") or path.endswith(".jsonl")
+            else "parquet" if path.endswith(".parquet")
+            else "csv" if path.endswith(".csv")
+            else None,
+            data_files=path,
+            split="train",
+        )
+        if ds is not None and len(ds) > 0:
+            return ds
+    except Exception:
+        pass
+
+    raise FileNotFoundError(
+        f"auto_read_data: could not load data from {path}. "
+        f"Supported formats: HF Dataset dir, JSON array, JSONL, Parquet, CSV."
+    )

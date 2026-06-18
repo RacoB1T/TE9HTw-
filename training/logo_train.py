@@ -338,6 +338,10 @@ class ModelArguments:
     peft_model_path: Optional[str] = field(default=None)
     lora_r: int = field(default=32)
     lora_alpha: int = field(default=16)
+    attn_implementation: Optional[str] = field(
+        default=None,
+        metadata={"help": "Attention implementation: 'flash_attention_2', 'sdpa', 'eager', etc."},
+    )
     
 
 @dataclass

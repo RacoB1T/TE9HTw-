@@ -7,6 +7,10 @@ from transformers import AutoTokenizer, HfArgumentParser, LlamaTokenizer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests, os
 from modelzipper.tutils import *
+
+# Fallback: modelzipper 0.2.5 does not export auto_read_data
+if "auto_read_data" not in dir():
+    from utils.utils import auto_read_data  # noqa: F401
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'evaluation')))
 from chat import apply_chat_template

@@ -13,6 +13,10 @@ from functools import partial
 from multiprocessing import Pool
 from multiprocessing import Process, Queue
 from modelzipper.tutils import *
+
+# Fallback: modelzipper 0.2.5 does not export auto_read_data
+if "auto_read_data" not in dir():
+    from utils.utils import auto_read_data  # noqa: F401
 from tqdm.contrib.concurrent import process_map
 import multiprocessing as mp
 from itertools import repeat

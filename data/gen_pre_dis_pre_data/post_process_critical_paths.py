@@ -2,8 +2,18 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 print(sys.path)
-from vllm import LLM, SamplingParams
+# vllm is only needed for the original batch-inference workflow;
+# the PostProcessor judge path uses call_llm_api instead.
+try:
+    from vllm import LLM, SamplingParams  # noqa: F401
+except ImportError:
+    LLM = None  # type: ignore
+    SamplingParams = None  # type: ignore
 from modelzipper.tutils import *
+
+# Fallback: modelzipper 0.2.5 does not export auto_read_data
+if "auto_read_data" not in dir():
+    from utils.utils import auto_read_data  # noqa: F401
 import fire
 import datasets
 from utils.call_llm_api import call_with_messages, api_client, MODEL_ENDPOINT
