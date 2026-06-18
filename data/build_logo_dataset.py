@@ -177,6 +177,9 @@ class NormalizedSample:
     rejected_answer_1: str
     rejected_answer_2: str
     label: str = ""
+    critical_chunks: List[dict] = field(default_factory=list)
+    partial_critical_chunks: List[dict] = field(default_factory=list)
+    irrelevant_chunks: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -435,16 +438,21 @@ class LogoDatasetBuilder:
         for idx, item in enumerate(dataset_items):
             source = item.get("_source_name", "unknown")
 
-            # Context chunks
+            # Context chunks (handle both legacy strings and dicts from gen_hf.py)
             all_ref = item.get("all_ref_text", [])
             if isinstance(all_ref, str):
                 all_ref = [all_ref]
-            # Clean: remove empty/None entries
-            chunks = [
-                str(c).strip() if c is not None else ""
-                for c in all_ref
-            ]
-            chunks = [c for c in chunks if c]
+            chunks: List[str] = []
+            for c in all_ref:
+                if c is None:
+                    continue
+                if isinstance(c, dict):
+                    # New format: {"chunk_id": int, "text": str} from gen_hf.py
+                    text = str(c.get("text", c.get("chunk", ""))).strip()
+                else:
+                    text = str(c).strip()
+                if text:
+                    chunks.append(text)
 
             # Question
             question = str(item.get("combined_question", "")).strip()
@@ -465,6 +473,17 @@ class LogoDatasetBuilder:
                 f"{source}:{idx}:{question}".encode()
             ).hexdigest()[:12]
 
+            # Paper-mode chunk fields (lists of {"chunk_id": int, "text": str} dicts)
+            critical_chunks = item.get("critical_chunks", [])
+            if not isinstance(critical_chunks, list):
+                critical_chunks = []
+            partial_critical_chunks = item.get("partial_critical_chunks", [])
+            if not isinstance(partial_critical_chunks, list):
+                partial_critical_chunks = []
+            irrelevant_chunks = item.get("irrelevant_chunks", [])
+            if not isinstance(irrelevant_chunks, list):
+                irrelevant_chunks = []
+
             samples.append(
                 NormalizedSample(
                     sample_id=sample_id,
@@ -475,6 +494,9 @@ class LogoDatasetBuilder:
                     rejected_answer_1=rejected_1,
                     rejected_answer_2=rejected_2,
                     label=label,
+                    critical_chunks=critical_chunks,
+                    partial_critical_chunks=partial_critical_chunks,
+                    irrelevant_chunks=irrelevant_chunks,
                 )
             )
 
@@ -537,11 +559,49 @@ class LogoDatasetBuilder:
         return unique[: self.num_chunks]
 
     def _build_paper_chunks(self, sample: NormalizedSample) -> List[str]:
-        """paper mode: combine critical + random irrelevant chunks."""
-        raise NotImplementedError(
-            "paper mode requires critical_chunks / irrelevant_chunks fields. "
-            "Use existing mode with current post-process output."
+        """paper mode: combine critical + sampled irrelevant chunks.
+
+        Merges all critical_chunks with a random sample of irrelevant_chunks,
+        sorts by chunk_id to restore original document order, deduplicates,
+        and limits to ``num_chunks``. All three answers share this same context.
+        """
+        critical: List[dict] = (
+            list(sample.critical_chunks) if sample.critical_chunks else []
         )
+        irrelevant: List[dict] = (
+            list(sample.irrelevant_chunks) if sample.irrelevant_chunks else []
+        )
+
+        # Sample irrelevant chunks to fill up to num_chunks
+        num_irrelevant = max(0, self.num_chunks - len(critical))
+        if num_irrelevant > 0 and irrelevant:
+            rng = random.Random(self.seed)
+            sampled_irrelevant = rng.sample(
+                irrelevant, min(num_irrelevant, len(irrelevant))
+            )
+        else:
+            sampled_irrelevant = []
+
+        # Combine and sort by chunk_id to restore original document order
+        all_chunks = critical + sampled_irrelevant
+        all_chunks.sort(
+            key=lambda x: x.get("chunk_id", 0) if isinstance(x, dict) else 0
+        )
+
+        # Extract text, deduplicate while preserving order
+        seen: set = set()
+        result: List[str] = []
+        for c in all_chunks:
+            if isinstance(c, dict):
+                text = str(c.get("text", c.get("chunk", ""))).strip()
+            else:
+                text = str(c).strip()
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+
+        return result[: self.num_chunks]
 
     # ------------------------------------------------------------------
     # Length control

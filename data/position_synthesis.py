@@ -21,6 +21,7 @@ that slot.
 
 from __future__ import annotations
 
+import hashlib
 import random
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -368,8 +369,12 @@ def derive_variant_seed(
 ) -> int:
     """Derive a deterministic sub-seed for a position variant.
 
+    Uses SHA-256 to produce a stable seed that is reproducible across
+    Python process restarts (unlike the built-in ``hash()`` which is
+    randomised per process by default).
+
     The same ``(global_seed, sample_id, variant_index)`` tuple always
     produces the same seed.
     """
-    base = f"{global_seed}:{sample_id}:{variant_index}"
-    return hash(base) & 0x7FFFFFFF
+    raw = f"{global_seed}:{sample_id}:{variant_index}".encode()
+    return int.from_bytes(hashlib.sha256(raw).digest()[:8], "big")

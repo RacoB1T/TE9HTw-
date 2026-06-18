@@ -94,35 +94,33 @@ class SimORPOTrainer(SimPOTrainer):
         concatenated_batch = self.move_to_device(batch, device=self.accelerator.device)
 
         input_ids = torch.concatenate([
-            concatenated_batch["chosen_input_ids"], 
-            concatenated_batch["reject_1_input_ids"], 
+            concatenated_batch["chosen_input_ids"],
+            concatenated_batch["reject_1_input_ids"],
             concatenated_batch["reject_2_input_ids"]
         ], dim=0)
 
         attention_mask = torch.concatenate([
-            concatenated_batch["chosen_attention_mask"], 
-            concatenated_batch["reject_1_attention_mask"], 
+            concatenated_batch["chosen_attention_mask"],
+            concatenated_batch["reject_1_attention_mask"],
             concatenated_batch["reject_2_attention_mask"]
         ], dim=0)
 
         position_ids = torch.concatenate([
-            concatenated_batch["chosen_position_ids"], 
-            concatenated_batch["reject_1_position_ids"], 
+            concatenated_batch["chosen_position_ids"],
+            concatenated_batch["reject_1_position_ids"],
             concatenated_batch["reject_2_position_ids"]
         ], dim=0)
 
         labels = torch.cat([
-            concatenated_batch["chosen_labels"], 
-            concatenated_batch["reject_1_labels"], 
+            concatenated_batch["chosen_labels"],
+            concatenated_batch["reject_1_labels"],
             concatenated_batch["reject_2_labels"]
         ], dim=0)
 
-        selected_pos_01 = torch.where(labels[0] != labels[1])[0]
-        selected_pos_12 = torch.where(labels[1] != labels[2])[0]
-        selected_pos_02 = torch.where(labels[0] != labels[2])[0]
-        selected_pos = torch.unique(torch.cat([selected_pos_01, selected_pos_12, selected_pos_02]))
-        
-        all_logits = model(input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False, return_dict=True).logits
+        all_logits = model(
+            input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, use_cache=False, return_dict=True,
+        ).logits
 
         all_logps = self.get_batch_logps(
             all_logits[:, -self.max_target_length:, :],
@@ -131,7 +129,7 @@ class SimORPOTrainer(SimPOTrainer):
             is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
         )
-        
+
         chosen_logps = all_logps[:len_chosen]
         prefix_chosen_logps = all_logps[len_chosen:len_chosen * 2]
         suffix_chosen_logps = all_logps[len_chosen * 2:]
@@ -222,49 +220,63 @@ class LOGOTrainer(SimPOTrainer):
         concatenated_batch = self.move_to_device(batch, device=self.accelerator.device)
 
         input_ids = torch.concatenate([
-            concatenated_batch["chosen_input_ids"], 
-            concatenated_batch["reject_1_input_ids"], 
+            concatenated_batch["chosen_input_ids"],
+            concatenated_batch["reject_1_input_ids"],
             concatenated_batch["reject_2_input_ids"]
         ], dim=0)
 
         attention_mask = torch.concatenate([
-            concatenated_batch["chosen_attention_mask"], 
-            concatenated_batch["reject_1_attention_mask"], 
+            concatenated_batch["chosen_attention_mask"],
+            concatenated_batch["reject_1_attention_mask"],
             concatenated_batch["reject_2_attention_mask"]
         ], dim=0)
 
         position_ids = torch.concatenate([
-            concatenated_batch["chosen_position_ids"], 
-            concatenated_batch["reject_1_position_ids"], 
+            concatenated_batch["chosen_position_ids"],
+            concatenated_batch["reject_1_position_ids"],
             concatenated_batch["reject_2_position_ids"]
         ], dim=0)
 
         labels = torch.cat([
-            concatenated_batch["chosen_labels"], 
-            concatenated_batch["reject_1_labels"], 
+            concatenated_batch["chosen_labels"],
+            concatenated_batch["reject_1_labels"],
             concatenated_batch["reject_2_labels"]
         ], dim=0)
 
-        selected_pos_01 = torch.where(labels[0] != labels[1])[0]
-        selected_pos_12 = torch.where(labels[1] != labels[2])[0]
-        selected_pos_02 = torch.where(labels[0] != labels[2])[0]
-        selected_pos = torch.unique(torch.cat([selected_pos_01, selected_pos_12, selected_pos_02]))
-        if selected_pos.size(0) == 0:
-            selected_pos = torch.arange(labels[0].size(0) - self.max_target_length, labels[0].size(0), device=selected_pos.device)
-        min_b, max_b = selected_pos.min(), selected_pos.max()
-        selected_pos = torch.arange(min_b, max_b+1, device=selected_pos.device)
-        del selected_pos_01, selected_pos_12, selected_pos_02
-        
-        all_logits = model(input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False, return_dict=True).logits
+        all_logits = model(
+            input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, use_cache=False, return_dict=True,
+        ).logits
 
-        all_logps = self.get_batch_logps(
-            all_logits[:, selected_pos, :],
-            labels[:, selected_pos],
-            average_log_prob=True,
-            is_encoder_decoder=self.is_encoder_decoder,
-            label_pad_token_id=self.label_pad_token_id,
-        )
-        
+        # ---- Causal shift: logits[t] predicts labels[t+1] ----
+        shift_logits = all_logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+
+        # ---- Answer mask: labels != -100 marks the full answer region ----
+        answer_mask = shift_labels != self.label_pad_token_id
+
+        # Compute per-sequence average log-probability over the COMPLETE answer.
+        # Only log_softmax the answer positions (avoid materializing a
+        # (3, seq_len, vocab_size) tensor for long sequences).
+        all_logps = []
+        for i in range(shift_logits.size(0)):
+            mask_i = answer_mask[i]
+            n_answer = mask_i.sum().item()
+            if n_answer == 0:
+                all_logps.append(torch.tensor(0.0, device=all_logits.device))
+                continue
+            # Extract only answer-position logits → (n_answer, vocab)
+            logits_i = shift_logits[i][mask_i]
+            labels_i = shift_labels[i][mask_i]
+            # log_softmax + gather the correct token log-probs
+            token_logps = logits_i.log_softmax(dim=-1)[
+                torch.arange(labels_i.size(0), device=labels_i.device), labels_i
+            ]
+            # Average over all answer tokens: (1/|y|) * Σ log π(y_t | ...)
+            all_logps.append(token_logps.mean())
+
+        all_logps = torch.stack(all_logps)
+
         chosen_logps = all_logps[:len_chosen]
         prefix_chosen_logps = all_logps[len_chosen:len_chosen * 2]
         suffix_chosen_logps = all_logps[len_chosen * 2:]
