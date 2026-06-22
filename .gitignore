@@ -1,7 +1,4 @@
-evaluation/longbench/results
-evaluation/longbench_v2/results
-evaluation/babilong/results
-evaluation/LongPPL/results
+evaluation
 *.log
 *.out
 *.err
