@@ -7,5 +7,4 @@ evaluation/LongPPL/results
 *.err
 */*/scripts/*
 *.pyc
-*.sh
 evaluation/longbench/scripts/
