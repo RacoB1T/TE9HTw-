@@ -4,4 +4,3 @@ evaluation
 *.err
 */*/scripts/*
 *.pyc
-evaluation/longbench/scripts/
