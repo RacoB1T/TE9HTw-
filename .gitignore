@@ -4,3 +4,7 @@ evaluation/
 *.err
 */*/scripts/*
 *.pyc
+*.zip
+AP*/
+DS*/
+ehrshot*/
