@@ -157,26 +157,29 @@ class SimORPOTrainer(SimPOTrainer):
         loss = losses.mean()
 
         if self.sft_weight > 0.0:
+            # Only compute CE on answer-token positions to save memory
             shift_logits = policy_chosen_logits[..., :-1, :].contiguous()
             shift_labels = batch["chosen_labels"][..., 1:].contiguous().to(shift_logits.device)
-            sft_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=self.label_pad_token_id,
-            )
+            answer_mask = shift_labels != self.label_pad_token_id
+            if answer_mask.sum() > 0:
+                active_logits = shift_logits[answer_mask]  # (n_answer, vocab)
+                active_labels = shift_labels[answer_mask]   # (n_answer,)
+                sft_loss = F.cross_entropy(active_logits, active_labels)
+            else:
+                sft_loss = torch.tensor(0.0, device=shift_logits.device)
             loss = loss + self.sft_weight * sft_loss
-            metrics[f"{prefix}sft_loss"] = sft_loss.detach().cpu()
+            metrics[f"{prefix}sft_loss"] = sft_loss.detach().cpu().item()
 
-        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
-        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu()
-        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
-        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
-        metrics[f"{prefix}logps/rejected1"] = policy_rejected_logps1.detach().mean().cpu()
-        metrics[f"{prefix}logps/rejected2"] = policy_rejected_logps2.detach().mean().cpu()
-        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
-        metrics[f"{prefix}logits/rejected1"] = policy_rejected_logits1.detach().mean().cpu()
-        metrics[f"{prefix}logits/rejected2"] = policy_rejected_logits2.detach().mean().cpu()
-        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
+        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu().item()
+        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu().item()
+        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu().item()
+        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu().item()
+        metrics[f"{prefix}logps/rejected1"] = policy_rejected_logps1.detach().mean().cpu().item()
+        metrics[f"{prefix}logps/rejected2"] = policy_rejected_logps2.detach().mean().cpu().item()
+        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu().item()
+        metrics[f"{prefix}logits/rejected1"] = policy_rejected_logits1.detach().mean().cpu().item()
+        metrics[f"{prefix}logits/rejected2"] = policy_rejected_logits2.detach().mean().cpu().item()
+        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu().item()
         return loss, metrics
 
 
@@ -207,89 +210,61 @@ class LOGOTrainer(SimPOTrainer):
         return losses, chosen_rewards, rejected_rewards
     
 
-    def concatenated_forward(self, model, batch): # one chosen, two rejected
+    def _forward_one_branch(self, model, batch, key_prefix):
+        """Forward a single branch and return its (logps, logits)."""
+        input_ids = batch[f"{key_prefix}_input_ids"]
+        attention_mask = batch[f"{key_prefix}_attention_mask"]
+        position_ids = batch[f"{key_prefix}_position_ids"]
+        labels = batch[f"{key_prefix}_labels"]
+
+        logits = model(
+            input_ids, attention_mask=attention_mask,
+            position_ids=position_ids, use_cache=False, return_dict=True,
+        ).logits  # (1, seq_len, vocab)
+
+        # Causal shift
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        answer_mask = shift_labels != self.label_pad_token_id
+
+        n_answer = answer_mask.sum().item()
+        if n_answer == 0:
+            return torch.tensor(0.0, device=logits.device), logits
+
+        logits_i = shift_logits[0][answer_mask[0]]
+        labels_i = shift_labels[0][answer_mask[0]]
+        token_logps = logits_i.log_softmax(dim=-1)[
+            torch.arange(labels_i.size(0), device=labels_i.device), labels_i
+        ]
+        return token_logps.mean(), logits
+
+    def concatenated_forward(self, model, batch):
+        """Forward each branch separately to save GPU memory.
+
+        Instead of concatenating 3 sequences into one (3, seq, vocab_size)
+        tensor, we process them one at a time. For large vocab models
+        (e.g. Qwen3.5 with 248K vocab) this saves ~4 GB of logits memory.
+        """
         len_chosen = batch['chosen_input_ids'].size(0)
 
         if len_chosen != 1:
             raise ValueError(
                 f"Current LOGO implementation requires per_device_train_batch_size=1, "
-                f"but got batch size {len_chosen}. The labels[index] comparison logic "
-                f"in concatenated_forward assumes exactly one sample per batch."
+                f"but got batch size {len_chosen}."
             )
 
-        concatenated_batch = self.move_to_device(batch, device=self.accelerator.device)
+        batch = self.move_to_device(batch, device=self.accelerator.device)
 
-        input_ids = torch.concatenate([
-            concatenated_batch["chosen_input_ids"],
-            concatenated_batch["reject_1_input_ids"],
-            concatenated_batch["reject_2_input_ids"]
-        ], dim=0)
-
-        attention_mask = torch.concatenate([
-            concatenated_batch["chosen_attention_mask"],
-            concatenated_batch["reject_1_attention_mask"],
-            concatenated_batch["reject_2_attention_mask"]
-        ], dim=0)
-
-        position_ids = torch.concatenate([
-            concatenated_batch["chosen_position_ids"],
-            concatenated_batch["reject_1_position_ids"],
-            concatenated_batch["reject_2_position_ids"]
-        ], dim=0)
-
-        labels = torch.cat([
-            concatenated_batch["chosen_labels"],
-            concatenated_batch["reject_1_labels"],
-            concatenated_batch["reject_2_labels"]
-        ], dim=0)
-
-        all_logits = model(
-            input_ids, attention_mask=attention_mask,
-            position_ids=position_ids, use_cache=False, return_dict=True,
-        ).logits
-
-        # ---- Causal shift: logits[t] predicts labels[t+1] ----
-        shift_logits = all_logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-
-        # ---- Answer mask: labels != -100 marks the full answer region ----
-        answer_mask = shift_labels != self.label_pad_token_id
-
-        # Compute per-sequence average log-probability over the COMPLETE answer.
-        # Only log_softmax the answer positions (avoid materializing a
-        # (3, seq_len, vocab_size) tensor for long sequences).
-        all_logps = []
-        for i in range(shift_logits.size(0)):
-            mask_i = answer_mask[i]
-            n_answer = mask_i.sum().item()
-            if n_answer == 0:
-                all_logps.append(torch.tensor(0.0, device=all_logits.device))
-                continue
-            # Extract only answer-position logits → (n_answer, vocab)
-            logits_i = shift_logits[i][mask_i]
-            labels_i = shift_labels[i][mask_i]
-            # log_softmax + gather the correct token log-probs
-            token_logps = logits_i.log_softmax(dim=-1)[
-                torch.arange(labels_i.size(0), device=labels_i.device), labels_i
-            ]
-            # Average over all answer tokens: (1/|y|) * Σ log π(y_t | ...)
-            all_logps.append(token_logps.mean())
-
-        all_logps = torch.stack(all_logps)
-
-        chosen_logps = all_logps[:len_chosen]
-        prefix_chosen_logps = all_logps[len_chosen:len_chosen * 2]
-        suffix_chosen_logps = all_logps[len_chosen * 2:]
-        chosen_logits = all_logits[:len_chosen]
-        prefix_chosen_logits = all_logits[len_chosen:len_chosen * 2]
-        suffix_chosen_logits = all_logits[len_chosen * 2:]
+        chosen_logps, chosen_logits = self._forward_one_branch(model, batch, "chosen")
+        rej1_logps, rej1_logits = self._forward_one_branch(model, batch, "reject_1")
+        rej2_logps, rej2_logits = self._forward_one_branch(model, batch, "reject_2")
 
         return (chosen_logps,
-                prefix_chosen_logps,
-                suffix_chosen_logps,
+                rej1_logps,
+                rej2_logps,
                 chosen_logits,
-                prefix_chosen_logits,
-                suffix_chosen_logits, )
+                rej1_logits,
+                rej2_logits, )
 
     def get_batch_loss_metrics(self, model, batch, train_eval):
         """Compute the SimPO loss and other metrics for the given batch of inputs for train or test."""
@@ -304,26 +279,29 @@ class LOGOTrainer(SimPOTrainer):
         loss = losses.mean()
 
         if self.sft_weight > 0.0:
+            # Only compute CE on answer-token positions to save memory
             shift_logits = policy_chosen_logits[..., :-1, :].contiguous()
             shift_labels = batch["chosen_labels"][..., 1:].contiguous().to(shift_logits.device)
-            sft_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=self.label_pad_token_id,
-            )
+            answer_mask = shift_labels != self.label_pad_token_id
+            if answer_mask.sum() > 0:
+                active_logits = shift_logits[answer_mask]  # (n_answer, vocab)
+                active_labels = shift_labels[answer_mask]   # (n_answer,)
+                sft_loss = F.cross_entropy(active_logits, active_labels)
+            else:
+                sft_loss = torch.tensor(0.0, device=shift_logits.device)
             loss = loss + self.sft_weight * sft_loss
-            metrics[f"{prefix}sft_loss"] = sft_loss.detach().cpu()
+            metrics[f"{prefix}sft_loss"] = sft_loss.detach().cpu().item()
 
-        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
-        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu()
-        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
-        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
-        metrics[f"{prefix}logps/rejected1"] = policy_rejected_logps1.detach().mean().cpu()
-        metrics[f"{prefix}logps/rejected2"] = policy_rejected_logps2.detach().mean().cpu()
-        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
-        metrics[f"{prefix}logits/rejected1"] = policy_rejected_logits1.detach().mean().cpu()
-        metrics[f"{prefix}logits/rejected2"] = policy_rejected_logits2.detach().mean().cpu()
-        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
+        metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu().item()
+        metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu().item()
+        metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu().item()
+        metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu().item()
+        metrics[f"{prefix}logps/rejected1"] = policy_rejected_logps1.detach().mean().cpu().item()
+        metrics[f"{prefix}logps/rejected2"] = policy_rejected_logps2.detach().mean().cpu().item()
+        metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu().item()
+        metrics[f"{prefix}logits/rejected1"] = policy_rejected_logits1.detach().mean().cpu().item()
+        metrics[f"{prefix}logits/rejected2"] = policy_rejected_logits2.detach().mean().cpu().item()
+        metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu().item()
         return loss, metrics
 
 

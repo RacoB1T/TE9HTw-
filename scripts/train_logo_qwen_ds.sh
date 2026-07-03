@@ -1,22 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# LOGO Training Launch Script (complete, self-contained, production-ready)
+# LOGO Training Launch Script — Qwen3.5-0.8B + DS Clinical Data
 # =============================================================================
 #
-# This script pins every hyperparameter required to reproduce LOGO training.
-# It is designed for 8×A800-80G with DeepSpeed ZeRO-3 and FlashAttention-2.
+# Designed for 2×GPU (IDs 0,1) with DeepSpeed ZeRO-2.
+# The 0.8B model is small enough to fit without CPU offload.
 #
 # Usage:
-#   bash scripts/train_logo.sh
+#   bash scripts/train_logo_qwen_ds.sh
 #
-# To override paths without editing the script:
-#   MODEL_PATH=... DATASET_PATH=... OUTPUT_DIR=... bash scripts/train_logo.sh
-#
-# Prerequisites:
-#   1. A DatasetDict saved via datasets.DatasetDict.save_to_disk() with
-#      "train" / "test" splits and the 12 standard LOGO fields.
-#   2. A HuggingFace-compatible instruct model (Llama-3.1-8B-Instruct or similar).
-#   3. 8 GPUs with CUDA + FlashAttention-2 installed.
+# To override paths:
+#   MODEL_PATH=... DATASET_PATH=... OUTPUT_DIR=... bash scripts/train_logo_qwen_ds.sh
 # =============================================================================
 
 set -euo pipefail
@@ -26,84 +20,82 @@ cd "$REPO_ROOT"
 
 # ==========================  paths  ===========================================
 
-# --- model (Llama-3.1-8B-Instruct or your base model) ---
-MODEL_PATH="${MODEL_PATH:-meta-llama/Llama-3.1-8B-Instruct}"
-MODEL_TYPE="${MODEL_TYPE:-llama-3}"          # llama-2 / llama-3 / mistral
+MODEL_PATH="${MODEL_PATH:-$HOME/models/Qwen3.5-0.8B}"
+MODEL_TYPE="${MODEL_TYPE:-qwen3.5}"
 
-# --- dataset ---
 # Must point to a DatasetDict directory (saved via datasets.save_to_disk).
-DATASET_PATH="${DATASET_PATH:-./data/train_data}"
+DATASET_PATH="${DATASET_PATH:-./data/DS_test/ds_logo_tokenized}"
 
-# --- output ---
-OUTPUT_DIR="${OUTPUT_DIR:-./outputs/logo_run_$(date +%Y%m%d_%H%M%S)}"
+# Output directory
+OUTPUT_DIR="${OUTPUT_DIR:-./outputs/qwen_ds_logo_$(date +%Y%m%d_%H%M%S)}"
+
+# ==========================  GPU  =============================================
+
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
 # ==========================  model config  ====================================
 
-# --- FlashAttention-2 (REQUIRED for long-context efficiency) ---
-ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
+# FlashAttention-2 (REQUIRED)
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-eager}"
 
-# --- position / RoPE (64K target; use 81920 for 80K) ---
-MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-65536}"
-ROPE_TYPE="${ROPE_TYPE:-}"                    # "yarn" / "dynamic" (set if needed)
-ROPE_FACTOR="${ROPE_FACTOR:-}"                # required when rope_type is set
-ROPE_THETA="${ROPE_THETA:-}"                  # optional, e.g. 500000.0
+# Position / RoPE — Qwen3.5 natively supports 32K, we set 8K for DS data
+MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-8192}"
+ROPE_TYPE="${ROPE_TYPE:-}"
+ROPE_FACTOR="${ROPE_FACTOR:-}"
+ROPE_THETA="${ROPE_THETA:-}"
 
-# --- LoRA ---
-LORA_R="${LORA_R:-32}"
-LORA_ALPHA="${LORA_ALPHA:-16}"
+# LoRA — smaller rank for 0.8B model
+LORA_R="${LORA_R:-16}"
+LORA_ALPHA="${LORA_ALPHA:-8}"
 
 # ==========================  training hyperparams  ============================
 
-# --- schedule ---
-NUM_EPOCHS="${NUM_EPOCHS:-2}"
-MAX_STEPS="${MAX_STEPS:--1}"                  # -1 = use epochs
-LEARNING_RATE="${LEARNING_RATE:-5e-7}"
+NUM_EPOCHS="${NUM_EPOCHS:-3}"
+MAX_STEPS="${MAX_STEPS:--1}"
+LEARNING_RATE="${LEARNING_RATE:-2e-5}"
 LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-cosine}"
-WARMUP_STEPS="${WARMUP_STEPS:-120}"
+WARMUP_STEPS="${WARMUP_STEPS:-20}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
-OPTIM="${OPTIM:-paged_adamw_32bit}"
+OPTIM="${OPTIM:-adamw_torch}"
 
-# --- batch ---
-PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-1}"   # LOGO requires 1
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+# Batch — LOGO requires per_device_train_batch_size=1
+PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-1}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 
-# --- sequence lengths ---
-MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-10000}"
-MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-2000}"
+# Sequence lengths
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-4096}"
+MAX_TARGET_LENGTH="${MAX_TARGET_LENGTH:-1024}"
 
-# --- LOGO / SimPO loss ---
-BETA="${BETA:-2.0}"
-GAMMA_BETA_RATIO="${GAMMA_BETA_RATIO:-0.25}"
-LOSS_TYPE="${LOSS_TYPE:-sigmoid}"             # sigmoid or hinge
+# LOGO / SimPO loss
+BETA="${BETA:-3.0}"
+GAMMA_BETA_RATIO="${GAMMA_BETA_RATIO:-0.2}"
+LOSS_TYPE="${LOSS_TYPE:-sigmoid}"
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.0}"
-SFT_WEIGHT="${SFT_WEIGHT:-0.1}"
+SFT_WEIGHT="${SFT_WEIGHT:-0.3}"
 
 # ==========================  DeepSpeed  =======================================
 
-# ZeRO-3 with CPU offload (for 8×80G).  Use zero3-fast.json for no offload.
-DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-training/config/zero3.json}"
+DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-training/config/zero2-minimal.json}"
 
 # ==========================  logging / checkpointing  =========================
 
 SEED="${SEED:-42}"
-SAVE_STEPS="${SAVE_STEPS:-100}"
-EVAL_STEPS="${EVAL_STEPS:-100}"
+SAVE_STEPS="${SAVE_STEPS:-50}"
+EVAL_STEPS="${EVAL_STEPS:-50}"
 LOGGING_STEPS="${LOGGING_STEPS:-1}"
-SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-10}"
-REPORT_TO="${REPORT_TO:-tensorboard}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-5}"
+REPORT_TO="${REPORT_TO:-none}"
 
 # ==========================  precision  =======================================
 
-# bf16 for A800/A100/H100; use --fp16 if bf16 not supported.
 BF16="${BF16:-True}"
 
 # ==========================  misc  ============================================
 
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-24}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 
-# ==========================  launch  ==========================================
+# ==========================  build optional args  =============================
 
-# Build optional arguments
 ROPE_TYPE_ARG=""
 if [ -n "$ROPE_TYPE" ]; then
     ROPE_TYPE_ARG="--rope_type $ROPE_TYPE"
@@ -125,12 +117,13 @@ if [ "$MAX_STEPS" -gt 0 ]; then
 fi
 
 echo "============================================================"
-echo " LOGO Training Launch"
+echo " LOGO Training — Qwen3.5-0.8B + DS Clinical Data"
 echo "============================================================"
 echo " Model:               $MODEL_PATH"
 echo " Model type:          $MODEL_TYPE"
 echo " Dataset:             $DATASET_PATH"
 echo " Output:              $OUTPUT_DIR"
+echo " GPUs:                $CUDA_VISIBLE_DEVICES"
 echo " Attention:           $ATTN_IMPLEMENTATION"
 echo " Max position embeds: $MAX_POSITION_EMBEDDINGS"
 echo " Max seq length:      $MAX_SEQ_LENGTH"
@@ -141,15 +134,16 @@ echo " LR scheduler:        $LR_SCHEDULER_TYPE"
 echo " Warmup steps:        $WARMUP_STEPS"
 echo " Batch size / GPU:    $PER_DEVICE_BATCH_SIZE"
 echo " Grad accum steps:    $GRADIENT_ACCUMULATION_STEPS"
+echo " Effective batch:     $((PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * 2))"
 echo " Beta:                $BETA"
 echo " Gamma/beta ratio:    $GAMMA_BETA_RATIO"
 echo " SFT weight:          $SFT_WEIGHT"
-echo " Loss type:           $LOSS_TYPE"
-echo " DeepSpeed:           $DEEPSPEED_CONFIG"
+echo " LoRA r/alpha:        $LORA_R / $LORA_ALPHA"
+echo " DeepSpeed config:    $DEEPSPEED_CONFIG"
 echo " Seed:                $SEED"
 echo "============================================================"
 
-deepspeed training/logo_train.py \
+deepspeed --include "localhost:${CUDA_VISIBLE_DEVICES//,/,}" training/logo_train.py \
     --model_name_or_path "$MODEL_PATH" \
     --model_type "$MODEL_TYPE" \
     --attn_implementation "$ATTN_IMPLEMENTATION" \

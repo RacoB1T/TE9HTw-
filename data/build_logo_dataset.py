@@ -42,11 +42,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from data.position_synthesis import (
     Layout,
     PositionValidationError,
+    TimeLayout,
     compute_layout,
     derive_variant_seed,
     synthesize_continuous_positions,
     synthesize_qa_tail_positions,
     synthesize_sparse_positions,
+    synthesize_temporal_positions,
     validate_overall_positions,
     validate_positions,
 )
@@ -177,6 +179,7 @@ class NormalizedSample:
     rejected_answer_1: str
     rejected_answer_2: str
     label: str = ""
+    chunk_timestamps: List[float] = field(default_factory=list)
     critical_chunks: List[dict] = field(default_factory=list)
     partial_critical_chunks: List[dict] = field(default_factory=list)
     irrelevant_chunks: List[dict] = field(default_factory=list)
@@ -307,7 +310,109 @@ class Llama3PromptAdapter(PromptAdapter):
         return answer_ids
 
 
+class Qwen35PromptAdapter(PromptAdapter):
+    """Prompt adapter for Qwen3.5 ChatML format.
+
+    Qwen3.5 uses ChatML delimiters::
+
+        <|im_start|>system
+        {system_message}<|im_end|>
+        <|im_start|>user
+        References:
+        [Chunk 1]
+        ...
+        Question:
+        {question}<|im_end|>
+        <|im_start|>assistant
+
+        {answer}<|im_end|>
+    """
+
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, system_message: str = DEFAULT_SYSTEM_MESSAGE):
+        super().__init__(tokenizer, system_message)
+        # Qwen3.5 special tokens
+        self.im_start_id: int = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        self.im_end_id: int = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        # Qwen3.5 has no BOS token
+        self.bos_id: int = tokenizer.bos_token_id  # None for Qwen3.5
+
+    # ------------------------------------------------------------------
+    def build_prompt_parts(self, context_chunks: List[str], question: str) -> PromptParts:
+        tk = self.tokenizer
+
+        # --- system ---
+        # Format: <|im_start|>system\n{message}<|im_end|>\n
+        system_tokens = (
+            [self.im_start_id]
+            + tk.encode("system\n", add_special_tokens=False)
+            + tk.encode(self.system_message, add_special_tokens=False)
+            + [self.im_end_id]
+            + tk.encode("\n", add_special_tokens=False)
+        )
+
+        # --- user header ---
+        # Format: <|im_start|>user\n
+        user_header_ids = (
+            [self.im_start_id]
+            + tk.encode("user\n", add_special_tokens=False)
+        )
+
+        # --- chunks ---
+        chunk_tokens = [
+            tk.encode(chunk_text, add_special_tokens=False)
+            for chunk_text in context_chunks
+        ]
+
+        # --- user framing (text between chunks) ---
+        user_framing_tokens: List[List[int]] = []
+        for i in range(len(context_chunks) + 1):
+            if i == 0:
+                text = "References:\n[Chunk 1]\n"
+            elif i < len(context_chunks):
+                text = f"\n\n[Chunk {i + 1}]\n"
+            else:
+                text = f"\n\nQuestion:\n{question}"
+            user_framing_tokens.append(tk.encode(text, add_special_tokens=False))
+
+        # Prepend user_header to first framing, append <|im_end|> + newline to last
+        user_framing_tokens[0] = user_header_ids + user_framing_tokens[0]
+        user_framing_tokens[-1] = user_framing_tokens[-1] + [self.im_end_id] + tk.encode("\n", add_special_tokens=False)
+
+        # --- assistant header ---
+        # Format: <|im_start|>assistant\n
+        # No <think> block — we set enable_thinking=False for training
+        assistant_header_tokens = (
+            [self.im_start_id]
+            + tk.encode("assistant\n", add_special_tokens=False)
+        )
+
+        return PromptParts(
+            system_tokens=system_tokens,
+            chunk_tokens=chunk_tokens,
+            user_framing_tokens=user_framing_tokens,
+            assistant_header_tokens=assistant_header_tokens,
+        )
+
+    # ------------------------------------------------------------------
+    def tokenize_answer(self, answer: str) -> List[int]:
+        tk = self.tokenizer
+        answer_ids = tk.encode(answer, add_special_tokens=False)
+
+        # Append <|im_end|> as EOS if not already present
+        if not answer_ids or answer_ids[-1] != self.im_end_id:
+            answer_ids.append(self.im_end_id)
+
+        return answer_ids
+
+
 # ---------------------------------------------------------------------------
+# Prompt adapter registry
+# ---------------------------------------------------------------------------
+
+PROMPT_ADAPTERS = {
+    "llama-3": Llama3PromptAdapter,
+    "qwen3.5": Qwen35PromptAdapter,
+}
 # Answer normalization
 # ---------------------------------------------------------------------------
 
@@ -341,6 +446,7 @@ class LogoDatasetBuilder:
         output_path: str,
         *,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        model_type: str = "llama-3",
         context_mode: str = "existing",
         max_seq_length: int = 10000,
         real_reference_tokens: int = 8192,
@@ -358,6 +464,7 @@ class LogoDatasetBuilder:
         deduplicate_answers: bool = True,
     ):
         self.output_path = output_path
+        self.model_type = model_type
         self.context_mode = context_mode
         self.max_seq_length = max_seq_length
         self.real_reference_tokens = real_reference_tokens
@@ -390,7 +497,13 @@ class LogoDatasetBuilder:
                 or 0
             )
 
-        self.prompt_adapter = Llama3PromptAdapter(self.tokenizer)
+        adapter_cls = PROMPT_ADAPTERS.get(self.model_type)
+        if adapter_cls is None:
+            raise ValueError(
+                f"Unknown model_type '{self.model_type}'. "
+                f"Available: {list(PROMPT_ADAPTERS.keys())}"
+            )
+        self.prompt_adapter = adapter_cls(self.tokenizer)
 
         # State
         self.report = BuildReport()
@@ -409,9 +522,19 @@ class LogoDatasetBuilder:
             # Try loading as a single Dataset
             try:
                 ds = datasets.load_from_disk(input_path)
-                for row in ds:
-                    dataset_items.append(row)
-                logger.info("Loaded %d samples from single dataset.", len(dataset_items))
+                if isinstance(ds, DatasetDict):
+                    # Loaded a DatasetDict with train/test splits
+                    for split_name, split_ds in ds.items():
+                        for row in split_ds:
+                            row["_source_name"] = split_name
+                            dataset_items.append(row)
+                        logger.info(
+                            "  Loaded %d samples from split '%s'", len(split_ds), split_name
+                        )
+                else:
+                    for row in ds:
+                        dataset_items.append(row)
+                    logger.info("Loaded %d samples from single dataset.", len(dataset_items))
             except Exception:
                 # Try loading each subdirectory
                 for subdir in sorted(os.listdir(input_path)):
@@ -469,6 +592,13 @@ class LogoDatasetBuilder:
             # Label (optional)
             label = str(item.get("label", "")).strip()
 
+            # Chunk timestamps (for time-driven position encoding)
+            ts_raw = item.get("chunk_timestamps", [])
+            if isinstance(ts_raw, list) and ts_raw:
+                chunk_ts = [float(t) if t is not None else 0.0 for t in ts_raw]
+            else:
+                chunk_ts = []
+
             sample_id = hashlib.md5(
                 f"{source}:{idx}:{question}".encode()
             ).hexdigest()[:12]
@@ -494,6 +624,7 @@ class LogoDatasetBuilder:
                     rejected_answer_1=rejected_1,
                     rejected_answer_2=rejected_2,
                     label=label,
+                    chunk_timestamps=chunk_ts,
                     critical_chunks=critical_chunks,
                     partial_critical_chunks=partial_critical_chunks,
                     irrelevant_chunks=irrelevant_chunks,
@@ -736,25 +867,22 @@ class LogoDatasetBuilder:
             pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens
         )
 
-        # 6. Build position IDs sequentially to ensure strict monotonicity.
+        # 6. Build position IDs preserving temporal order for clinical data.
         #
         # The token sequence is:
         #   system | framing[0] chunk[0] framing[1] chunk[1] ... framing[N] | assistant_header | answer
         #
-        # Position layout:
+        # Position layout (time-driven when timestamps available):
         #   system:  [0, system_len)                                     continuous
-        #   context: [system_len, tail_start)   divided into N slots     synthetic
+        #   context: [system_len, tail_start)   time-proportional slots  temporal
         #   tail:    [tail_start, K_target)                              continuous
-        #
-        # Each "chunk group" (framing[i] + chunk[i]) gets one slot.
-        # The last framing (question text) and assistant_header+answer are in the tail.
 
         system_len, question_len, assistant_header_len = self._compute_budget(pp)
 
         # Group sizes: one per chunk (framing[i] + chunk[i])
         group_lens: List[int] = []
         for ci in range(pp.num_chunks):
-            f_idx = 0 if ci == 0 else ci  # framing[0] goes with chunk[0], framing[1] with chunk[1], etc.
+            f_idx = 0 if ci == 0 else ci
             group_lens.append(len(pp.user_framing_tokens[f_idx]) + pp.chunk_lens[ci])
 
         # Last framing + assistant_header are in the tail
@@ -763,40 +891,67 @@ class LogoDatasetBuilder:
         tail_total = tail_prefix_len + max_answer
 
         tail_start = self.target_position_length - tail_total
-        tail_start = max(tail_start, system_len + sum(group_lens))  # ensure tail_start > context end
+        tail_start = max(tail_start, system_len + sum(group_lens))
 
-        # Build slot boundaries for chunk groups
-        context_size = tail_start - system_len
+        # Map chunk timestamps if available (preserve clinical temporal order)
+        use_time_driven = bool(sample.chunk_timestamps) and len(sample.chunk_timestamps) == len(sample.context_chunks)
+        group_timestamps: List[float] = []
+        if use_time_driven:
+            # Map each shared chunk back to its original timestamp
+            for chunk_text in shared_chunks:
+                try:
+                    orig_idx = sample.context_chunks.index(chunk_text)
+                    group_timestamps.append(sample.chunk_timestamps[orig_idx])
+                except (ValueError, IndexError):
+                    use_time_driven = False
+                    break
+
         num_groups = len(group_lens)
-        slot_boundaries: List[Tuple[int, int]] = []
-        if num_groups > 0 and context_size > 0:
-            slot_width = context_size // num_groups
-            leftover = context_size % num_groups
-            cursor = system_len
-            for gi in range(num_groups):
-                extra = 1 if gi < leftover else 0
-                start = cursor
-                end = cursor + slot_width + extra
-                slot_boundaries.append((start, end))
-                cursor = end
 
-        # Synthesize group positions
+        # Fallback to index-based ordering if no timestamps
+        if not use_time_driven:
+            group_timestamps = [float(i) for i in range(num_groups)]
+
+        # Build position IDs using time-driven layout
+        time_layout = TimeLayout(
+            system_len=system_len,
+            chunk_lens=list(group_lens),
+            chunk_timestamps=list(group_timestamps),
+            question_len=question_len,
+            assistant_header_len=assistant_header_len,
+            max_answer_len=max_answer,
+            K_target=self.target_position_length,
+        )
+
         rng = random.Random(variant_seed)
-        group_positions: List[List[int]] = []
-        for gi in range(num_groups):
-            gl = group_lens[gi]
-            sb = slot_boundaries[gi]
-            if strategy == "continuous":
-                start = rng.randint(sb[0], max(sb[0], sb[1] - gl))
-                group_positions.append(list(range(start, start + gl)))
+        if use_time_driven and len(group_lens) > 0:
+            if strategy == "sparse":
+                # Time-driven with larger jitter for sparse variety
+                group_positions = synthesize_temporal_positions(
+                    group_lens, list(time_layout.chunk_starts), seed=variant_seed,
+                    jitter_ratio=0.15,  # larger jitter for sparse
+                )
             else:
-                # Sparse: sample gl unique positions from the slot, sort them
-                available = list(range(sb[0], sb[1]))
-                if gl > len(available):
-                    gl = len(available)
-                selected = rng.sample(available, gl)
-                selected.sort()
-                group_positions.append(selected)
+                group_positions = synthesize_temporal_positions(
+                    group_lens, list(time_layout.chunk_starts), seed=variant_seed
+                )
+            group_positions = [g.tolist() for g in group_positions]
+        else:
+            # Equal-slot fallback
+            context_size = time_layout.context_region_size
+            num_groups = len(group_lens)
+            slot_boundaries: List[Tuple[int, int]] = []
+            if num_groups > 0 and context_size > 0:
+                slot_width = context_size // num_groups
+                leftover = context_size % num_groups
+                cursor = system_len
+                for gi in range(num_groups):
+                    extra = 1 if gi < leftover else 0
+                    start = cursor
+                    end = cursor + slot_width + extra
+                    slot_boundaries.append((start, end))
+                    cursor = end
+                    group_positions.append(selected)
 
         # Build shared prefix position IDs sequentially
         def _build_branch_positions(answer_len: int) -> List[int]:
@@ -1192,6 +1347,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_path", required=True, help="Output directory for DatasetDict")
     p.add_argument("--tokenizer_path", required=True, help="HuggingFace tokenizer path")
     p.add_argument(
+        "--model_type", default="llama-3", choices=list(PROMPT_ADAPTERS.keys()),
+        help="Model type for prompt format (default: llama-3)"
+    )
+    p.add_argument(
         "--context_mode", default="existing", choices=["existing", "paper"],
         help="Context construction mode (default: existing)"
     )
@@ -1221,6 +1380,7 @@ def main() -> None:
     builder = LogoDatasetBuilder(
         tokenizer_path=args.tokenizer_path,
         output_path=args.output_path,
+        model_type=args.model_type,
         context_mode=args.context_mode,
         max_seq_length=args.max_seq_length,
         real_reference_tokens=args.real_reference_tokens,

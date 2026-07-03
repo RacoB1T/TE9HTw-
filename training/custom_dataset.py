@@ -13,7 +13,7 @@ class BasicDataCollator:
 
     def auto_cut_length(self, t, is_label=False):
         if t.size(-1) > self.max_seq_length:
-            # cut the seq length from the middle
+            # Keep beginning (prompt) + end (answer), drop middle (chunks)
             t = torch.cat([t[:self.max_seq_length // 2], t[-self.max_seq_length // 2:]], dim=0)
         elif t.size(-1) < self.max_seq_length:
             padding_length = self.max_seq_length - t.size(-1)

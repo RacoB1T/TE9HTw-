@@ -232,6 +232,99 @@ def synthesize_qa_tail_positions(
     return torch.arange(tail_start, tail_start + total, dtype=torch.long)
 
 
+# ---------------------------------------------------------------------------
+# Time-driven position synthesis
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TimeLayout:
+    """Position-space layout computed from timestamps (for clinical data)."""
+
+    system_len: int
+    chunk_lens: List[int]
+    chunk_timestamps: List[float]  # Unix timestamps (seconds) for each chunk
+    question_len: int
+    assistant_header_len: int
+    max_answer_len: int
+    K_target: int
+
+    # Computed
+    tail_start: int = 0
+    context_region_size: int = 0
+    chunk_starts: List[int] = ()
+
+    def __post_init__(self) -> None:
+        self.num_chunks = len(self.chunk_lens)
+
+        tail_len = self.question_len + self.assistant_header_len + self.max_answer_len
+        self.tail_start = max(self.K_target - tail_len, self.system_len)
+        self.context_region_size = self.tail_start - self.system_len
+
+        if self.num_chunks == 0 or not self.chunk_timestamps:
+            self.chunk_starts = ()
+            return
+
+        # Map timestamps proportionally to position space
+        t_min = min(self.chunk_timestamps)
+        t_max = max(self.chunk_timestamps)
+        t_span = max(t_max - t_min, 1.0)  # avoid division by zero
+
+        starts = []
+        cursor = self.system_len
+        for i in range(self.num_chunks):
+            if i == 0:
+                # First chunk at system boundary
+                starts.append(cursor)
+            else:
+                # Proportional position based on time gap from previous chunk
+                dt_prev = max(self.chunk_timestamps[i] - self.chunk_timestamps[i - 1], 0.0)
+                max_pos_gap = max(1, (self.context_region_size - cursor) // (self.num_chunks - i))
+                gap = min(int(dt_prev / t_span * self.context_region_size), max_pos_gap)
+                cursor = min(cursor + gap, self.tail_start - sum(self.chunk_lens[i:]) - 1)
+                starts.append(cursor)
+            cursor += self.chunk_lens[i]
+
+        self.chunk_starts = tuple(starts)
+
+
+def synthesize_temporal_positions(
+    chunk_lens: List[int],
+    chunk_starts: List[int],
+    seed: int = 0,
+    jitter_ratio: float = 0.02,
+) -> List[torch.Tensor]:
+    """Generate time-driven position IDs that preserve temporal order.
+
+    Each chunk receives **consecutive** position IDs starting at its
+    time-proportional ``chunk_start`` position. Temporal gaps between
+    chunks are preserved as position gaps.
+
+    *jitter_ratio* controls how much random offset is applied:
+    0.02 (2%) for continuous, 0.15 (15%) for sparse.
+
+    Returns one 1-D ``LongTensor`` per chunk.
+    """
+    rng = random.Random(seed)
+    position_ids: List[torch.Tensor] = []
+
+    for i, chunk_len in enumerate(chunk_lens):
+        base_start = chunk_starts[i]
+
+        # Jitter: random backward offset within available gap
+        if i > 0:
+            prev_end = chunk_starts[i - 1] + chunk_lens[i - 1]
+            max_jitter = max(0, int((base_start - prev_end) * jitter_ratio * 2))
+            if max_jitter > 0:
+                jitter = rng.randint(0, max_jitter)
+                base_start -= jitter
+
+        positions = torch.arange(base_start, base_start + chunk_len, dtype=torch.long)
+        position_ids.append(positions)
+
+    return position_ids
+
+
 def synthesize_prefix_positions(
     system_len: int,
     chunk_position_ids: List[torch.Tensor],

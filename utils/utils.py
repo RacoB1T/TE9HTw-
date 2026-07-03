@@ -33,6 +33,26 @@ ATTENTION_LORA_TARGETS = [
     "o_proj",
 ]
 
+# Qwen3.5 hybrid architecture: full_attention (q/k/v/o_proj) +
+# linear attention / GatedDeltaNet (in_proj_* + out_proj + conv1d)
+# NOTE: Only target full_attention layers for LoRA. Adding LoRA to
+# GatedDeltaNet layers increases trainable params and backward graph
+# complexity, leading to OOM. Full attention alone is sufficient.
+QWEN35_LORA_TARGETS = [
+    # Full attention layers only (every 4th layer)
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+]
+
+
+def _get_lora_targets(model_type: str) -> List[str]:
+    """Return LoRA target module names for the given *model_type*."""
+    if model_type in ("qwen3.5",):
+        return list(QWEN35_LORA_TARGETS)
+    return list(ATTENTION_LORA_TARGETS)
+
 
 def _get_torch_dtype(training_args: Any) -> Optional[torch.dtype]:
     """Infer model loading dtype from Hugging Face TrainingArguments."""
@@ -53,7 +73,14 @@ def _configure_position_encoding(config: Any, model_args: Any) -> Any:
     ModelArguments.max_position_embeddings defaults to 10 in the
     released code. We must not overwrite an existing 4K/8K/80K
     context window with that default value.
+
+    For models with nested config (e.g. Qwen3.5's text_config / vision_config),
+    position/RoPE settings live in the text sub-config.
     """
+    # Resolve the effective config for position/RoPE settings.
+    # Qwen3.5 stores these in config.text_config; Llama keeps them at top level.
+    pos_config = getattr(config, "text_config", config)
+
     requested_max_position = getattr(
         model_args,
         "max_position_embeddings",
@@ -61,7 +88,7 @@ def _configure_position_encoding(config: Any, model_args: Any) -> Any:
     )
 
     original_max_position = getattr(
-        config,
+        pos_config,
         "max_position_embeddings",
         None,
     )
@@ -80,12 +107,12 @@ def _configure_position_encoding(config: Any, model_args: Any) -> Any:
             original_max_position,
             requested_max_position,
         )
-        config.max_position_embeddings = int(requested_max_position)
+        pos_config.max_position_embeddings = int(requested_max_position)
 
     rope_theta = getattr(model_args, "rope_theta", None)
     if rope_theta is not None:
         logger.info("Set rope_theta to %s", rope_theta)
-        config.rope_theta = float(rope_theta)
+        pos_config.rope_theta = float(rope_theta)
 
     rope_type = getattr(model_args, "rope_type", None)
     rope_factor = getattr(model_args, "factor", None)
@@ -97,17 +124,17 @@ def _configure_position_encoding(config: Any, model_args: Any) -> Any:
             )
 
         if Version(transformers.__version__) >= Version("4.44.0"):
-            config.rope_scaling = {
+            pos_config.rope_scaling = {
                 "rope_type": str(rope_type),
                 "factor": float(rope_factor),
             }
         else:
-            config.rope_scaling = {
+            pos_config.rope_scaling = {
                 "type": str(rope_type),
                 "factor": float(rope_factor),
             }
 
-        logger.info("Set rope_scaling to %s", config.rope_scaling)
+        logger.info("Set rope_scaling to %s", pos_config.rope_scaling)
 
     return config
 
@@ -215,12 +242,15 @@ def _apply_lora(
             if any(key in module_name for key in trainable_names):
                 modules_to_save.append(module_name)
 
+        model_type = getattr(model_args, "model_type", "llama")
+        lora_targets = _get_lora_targets(model_type)
+
         lora_config = LoraConfig(
             r=int(getattr(model_args, "lora_r", 32)),
             lora_alpha=int(
                 getattr(model_args, "lora_alpha", 16)
             ),
-            target_modules=ATTENTION_LORA_TARGETS,
+            target_modules=lora_targets,
             modules_to_save=modules_to_save if modules_to_save else None,
             lora_dropout=0.0,
             bias="none",
