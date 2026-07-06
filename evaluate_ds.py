@@ -28,7 +28,7 @@ import numpy as np
 import torch
 from rouge import Rouge
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -40,15 +40,15 @@ logger = logging.getLogger(__name__)
 
 SECTION_PATTERNS_GENERATED = {
     "Diagnosis": re.compile(
-        r"(?:^|\n)D(?:iagnosis|IAGNOSIS)\s*:\s*\n?",
+        r"(?:^|\n)(?:\*{0,2})D(?:iagnosis|IAGNOSIS)(?:\*{0,2})\s*:\s*\n?",
         re.IGNORECASE,
     ),
     "Hospital Course": re.compile(
-        r"(?:^|\n)(?:Brief\s*)?H(?:ospital|OSPITAL)\s*C(?:ourse|OURSE)(?:\s*Summary)?\s*:\s*\n?",
+        r"(?:^|\n)(?:\*{0,2})(?:Brief\s*)?H(?:ospital|OSPITAL)\s*C(?:ourse|OURSE)(?:\s*Summary)?(?:\*{0,2})\s*:\s*\n?",
         re.IGNORECASE,
     ),
     "Discharge Instructions": re.compile(
-        r"(?:^|\n)D(?:ischarge|ISCHARGE)\s*I(?:nstructions|NSTRUCTIONS)\s*:\s*\n?",
+        r"(?:^|\n)(?:\*{0,2})D(?:ischarge|ISCHARGE)\s*(?:I(?:nstructions|NSTRUCTIONS)|S(?:ummary|UMMARY))(?:/\s*Followup)?(?:\*{0,2})\s*:\s*\n?",
         re.IGNORECASE,
     ),
 }
@@ -90,7 +90,7 @@ def extract_sections(text: str, is_ground_truth: bool = False) -> Dict[str, str]
 # Prompt builder (matches the training format)
 # ---------------------------------------------------------------------------
 
-PROMPT_TEMPLATE = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+PROMPT_TEMPLATE_LLAMA3 = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
 Below are some references. Read them carefully and answer the question using the references.<|eot_id|><|start_header_id|>user<|end_header_id|>
 
@@ -101,6 +101,23 @@ Question:
 Based on the clinical records above, write a complete discharge summary including Diagnosis, Brief Hospital Course, and Discharge Instructions.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
 """
+
+PROMPT_TEMPLATE_LLAMA2 = """<s>[INST] <<SYS>>
+Below are some references. Read them carefully and answer the question using the references.
+<</SYS>>
+
+References:
+{chunks_text}
+
+Question:
+Based on the clinical records above, write a complete discharge summary including Diagnosis, Brief Hospital Course, and Discharge Instructions. [/INST] """
+
+
+def get_prompt_template(model_path: str) -> str:
+    """Auto-select prompt template based on model path."""
+    if "Llama2" in model_path or "llama-2" in model_path.lower():
+        return PROMPT_TEMPLATE_LLAMA2
+    return PROMPT_TEMPLATE_LLAMA3
 
 
 def chunk_events(events: List[Dict[str, str]], chunk_size: int = 300) -> List[str]:
@@ -124,7 +141,7 @@ def chunk_events(events: List[Dict[str, str]], chunk_size: int = 300) -> List[st
     return chunks
 
 
-def build_prompt(events: List[Dict[str, str]], max_chunks: int = 16) -> str:
+def build_prompt(events: List[Dict[str, str]], model_path: str = "", max_chunks: int = 16) -> str:
     """Build inference prompt from clinical events."""
     events.sort(key=lambda x: x.get("TIME", ""))
     chunks = chunk_events(events, chunk_size=300)
@@ -139,7 +156,8 @@ def build_prompt(events: List[Dict[str, str]], max_chunks: int = 16) -> str:
         chunk_lines.append(f"[Chunk {i+1}]\n{chunk}")
     chunks_text = "\n\n".join(chunk_lines)
 
-    return PROMPT_TEMPLATE.format(chunks_text=chunks_text)
+    template = get_prompt_template(model_path)
+    return template.format(chunks_text=chunks_text)
 
 
 # ---------------------------------------------------------------------------
@@ -162,9 +180,11 @@ def generate_summary(
     output = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
-        temperature=0.0,           # greedy decoding for reproducibility
-        do_sample=False,
-        repetition_penalty=1.15,    # discourage repetition
+        do_sample=True,
+        temperature=0.6,            # higher temp breaks self-reinforcing loops
+        top_p=0.9,                  # nucleus sampling: cut low-prob tail
+        repetition_penalty=1.2,     # stronger anti-repetition
+        min_new_tokens=200,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
@@ -202,6 +222,82 @@ def evaluate_rouge(
                 results[section] = scores[0]["rouge-l"]["f"] * 100
             except Exception:
                 results[section] = 0.0
+        else:
+            results[section] = 0.0
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# BERTScore with Bio_ClinicalBERT
+# ---------------------------------------------------------------------------
+
+_bertscore_model = None
+_bertscore_tokenizer = None
+
+
+def _load_bertscore():
+    """Lazy-load Bio_ClinicalBERT for semantic similarity evaluation."""
+    global _bertscore_model, _bertscore_tokenizer
+    if _bertscore_model is None:
+        from transformers import AutoModel, AutoTokenizer
+        logger.info("Loading Bio_ClinicalBERT for BERTScore...")
+        _bertscore_tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+        _bertscore_model = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+        _bertscore_model.eval()
+        if torch.cuda.is_available():
+            _bertscore_model = _bertscore_model.cuda()
+        logger.info("Bio_ClinicalBERT loaded.")
+
+
+@torch.no_grad()
+def _embed_text(text: str, max_length: int = 512) -> torch.Tensor:
+    """Get mean-pooled embedding for a text using Bio_ClinicalBERT."""
+    _load_bertscore()
+    device = next(_bertscore_model.parameters()).device
+    inputs = _bertscore_tokenizer(
+        text, return_tensors="pt", truncation=True, max_length=max_length, padding=True,
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    outputs = _bertscore_model(**inputs)
+    # Mean pool over token dimension (excluding [CLS] and [SEP])
+    attention_mask = inputs["attention_mask"].unsqueeze(-1).float()
+    embeddings = outputs.last_hidden_state * attention_mask
+    pooled = embeddings.sum(dim=1) / attention_mask.sum(dim=1)
+    return pooled  # (1, hidden_dim)
+
+
+def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Cosine similarity between two embedding vectors."""
+    a_norm = a / (a.norm(dim=-1, keepdim=True) + 1e-8)
+    b_norm = b / (b.norm(dim=-1, keepdim=True) + 1e-8)
+    return (a_norm * b_norm).sum(dim=-1).item()
+
+
+def evaluate_bertscore(
+    generated: Dict[str, str],
+    gold: Dict[str, str],
+) -> Dict[str, float]:
+    """Compute BERTScore (cosine similarity of Bio_ClinicalBERT embeddings).
+
+    Evaluates both full text and per-section.
+    """
+    results = {}
+
+    # Full text
+    gen_full = "\n\n".join(generated.values())
+    gold_full = "\n\n".join(gold.values())
+    if gen_full.strip() and gold_full.strip():
+        gen_emb = _embed_text(gen_full)
+        gold_emb = _embed_text(gold_full)
+        results["full"] = cosine_similarity(gen_emb, gold_emb) * 100
+
+    # Per section
+    for section in generated:
+        if generated[section].strip() and gold[section].strip():
+            gen_emb = _embed_text(generated[section])
+            gold_emb = _embed_text(gold[section])
+            results[section] = cosine_similarity(gen_emb, gold_emb) * 100
         else:
             results[section] = 0.0
 
@@ -276,6 +372,7 @@ def main():
 
     # --- Evaluate ---
     all_rouge: Dict[str, List[float]] = {"full": [], "Diagnosis": [], "Hospital Course": [], "Discharge Instructions": []}
+    all_bertscore: Dict[str, List[float]] = {"full": [], "Diagnosis": [], "Hospital Course": [], "Discharge Instructions": []}
     results_detail: List[Dict] = []
 
     for pid in tqdm(test_ids, desc="Evaluating"):
@@ -300,15 +397,16 @@ def main():
             gold_text = f.read().strip()
 
         # Generate
-        prompt = build_prompt(events, max_chunks=args.max_chunks)
+        prompt = build_prompt(events, model_path=args.model_path, max_chunks=args.max_chunks)
         generated = generate_summary(model, tokenizer, prompt, max_new_tokens=args.max_new_tokens)
 
         # Extract sections
         gen_sections = extract_sections(generated, is_ground_truth=False)
         gold_sections = extract_sections(gold_text, is_ground_truth=True)
 
-        # Compute ROUGE
+        # Compute ROUGE + BERTScore
         rouge_scores = evaluate_rouge(gen_sections, gold_sections)
+        bert_scores = evaluate_bertscore(gen_sections, gold_sections)
 
         # Save generated summary
         out_path = os.path.join(args.output_dir, f"gen_{pid}.txt")
@@ -318,6 +416,7 @@ def main():
         detail = {
             "patient_id": pid,
             "rouge": rouge_scores,
+            "bertscore": bert_scores,
             "generated_len": len(generated),
             "gold_len": len(gold_text),
         }
@@ -325,18 +424,26 @@ def main():
         for key, val in rouge_scores.items():
             if key in all_rouge:
                 all_rouge[key].append(val)
+        for key, val in bert_scores.items():
+            if key in all_bertscore:
+                all_bertscore[key].append(val)
 
     # --- Report ---
     print("\n" + "=" * 60)
     print("Evaluation Results — ROUGE-L F1 (%)")
     print("=" * 60)
-    overall_results = {}
     for section, scores in all_rouge.items():
         if scores:
-            mean_val = np.mean(scores)
-            std_val = np.std(scores)
-            overall_results[section] = (mean_val, std_val)
-            print(f"  {section:<30} {mean_val:6.2f} ± {std_val:5.2f}")
+            print(f"  {section:<30} {np.mean(scores):6.2f} ± {np.std(scores):5.2f}")
+        else:
+            print(f"  {section:<30}  N/A")
+
+    print("\n" + "=" * 60)
+    print("Evaluation Results — BERTScore (%)")
+    print("=" * 60)
+    for section, scores in all_bertscore.items():
+        if scores:
+            print(f"  {section:<30} {np.mean(scores):6.2f} ± {np.std(scores):5.2f}")
         else:
             print(f"  {section:<30}  N/A")
 
@@ -344,7 +451,8 @@ def main():
     report = {
         "model_path": args.model_path,
         "num_samples": len(results_detail),
-        "overall": {k: {"mean": float(v[0]), "std": float(v[1])} for k, v in overall_results.items()},
+        "rouge_overall": {k: {"mean": float(np.mean(v)), "std": float(np.std(v))} for k, v in all_rouge.items() if v},
+        "bertscore_overall": {k: {"mean": float(np.mean(v)), "std": float(np.std(v))} for k, v in all_bertscore.items() if v},
         "details": results_detail,
     }
     report_path = os.path.join(args.output_dir, "eval_report.json")

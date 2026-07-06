@@ -106,8 +106,17 @@ LAB_REFERENCE_RANGES = {
     "spo2":             (95, 100, 85, 100),
 }
 
-# Lab names to search for in text
-_LAB_NAME_PATTERN = "|".join(re.escape(name) for name in LAB_REFERENCE_RANGES)
+# Pre-compiled lab regex patterns (avoids runtime recompilation per chunk)
+_LAB_REGEX_CACHE: Dict[str, re.Pattern] = {}
+for _lab_name in LAB_REFERENCE_RANGES:
+    _pattern = re.compile(
+        r'(?:^|\s|;|,)'
+        + re.escape(_lab_name)
+        + r'(?:\s*(?:is|:|was|of|=)\s*|[\s,;]+)'
+        + r'(\d+\.?\d*)',
+        re.IGNORECASE,
+    )
+    _LAB_REGEX_CACHE[_lab_name] = _pattern
 
 
 def _extract_lab_values(text: str) -> List[Tuple[str, float, str]]:
@@ -119,14 +128,10 @@ def _extract_lab_values(text: str) -> List[Tuple[str, float, str]]:
     results = []
     text_lower = text.lower()
     for lab_name, (low, high, crit_low, crit_high) in LAB_REFERENCE_RANGES.items():
-        # Match patterns like "Creatinine is 5.20 mg/dL" or "Creatinine: 5.2"
-        for m in re.finditer(
-            r'(?:^|\s|;|,)'
-            + re.escape(lab_name)
-            + r'(?:\s*(?:is|:|was|of|=)\s*|[\s,;]+)'
-            + r'(\d+\.?\d*)',
-            text_lower,
-        ):
+        pat = _LAB_REGEX_CACHE.get(lab_name)
+        if pat is None:
+            continue
+        for m in pat.finditer(text_lower):
             val = float(m.group(1))
             if val <= crit_low or val >= crit_high:
                 severity = "critical"
@@ -753,6 +758,80 @@ def generate_rejected_structural(
     return " ".join(result_parts)
 
 
+def generate_rejected_by_dx_inflation(
+    chosen_answer: str,
+    rng: random.Random,
+    inflation_factor: float = 5.0,
+) -> str:
+    """Inflate the Diagnosis section with redundant/extraneous diagnoses.
+
+    This trains the model to prefer concise diagnosis lists over verbose ones.
+    """
+    # Split into sections
+    dx_match = re.search(r'(?:^|\n)Diagnosis:\s*\n', chosen_answer)
+    hc_match = re.search(r'(?:^|\n)Brief Hospital Course:\s*\n', chosen_answer)
+    di_match = re.search(r'(?:^|\n)Discharge Instructions:\s*\n', chosen_answer)
+
+    if not dx_match or not hc_match:
+        return generate_rejected_by_critical_deletion_and_swap(chosen_answer, rng)
+
+    dx_start = dx_match.end()
+    dx_end = hc_match.start()
+    original_dx = chosen_answer[dx_start:dx_end].strip()
+
+    # Extract individual diagnoses
+    dx_lines = [l.strip() for l in original_dx.split('\n') if l.strip()]
+    dx_items = []
+    for line in dx_lines:
+        # Remove leading numbering like "1. " or "- "
+        item = re.sub(r'^\d+\.\s*|[-•]\s*', '', line).strip()
+        if item:
+            dx_items.append(item)
+
+    if len(dx_items) < 2:
+        return generate_rejected_by_critical_deletion_and_swap(chosen_answer, rng)
+
+    # Inflate: duplicate, add generic complications, common symptoms
+    generic_extras = [
+        "Hypertension", "Hyperlipidemia", "Anemia", "Hypokalemia",
+        "Hypomagnesemia", "Hyponatremia", "Metabolic acidosis",
+        "Respiratory failure", "Acute kidney injury", "Thrombocytopenia",
+        "Leukocytosis", "Hyperglycemia", "Hypocalcemia", "Hypoalbuminemia",
+        "Electrolyte imbalance", "Dehydration", "Malnutrition",
+        "Urinary tract infection", "Pneumonia", "Sepsis",
+        "Constipation", "Anxiety", "Depression", "Insomnia",
+        "Gastroesophageal reflux disease", "Osteoarthritis",
+        "Vitamin D deficiency", "Hypothyroidism", "Atrial fibrillation",
+        "Coronary artery disease", "Chronic obstructive pulmonary disease",
+        "Peripheral vascular disease", "Deep vein thrombosis",
+        "Pulmonary embolism", "Cellulitis", "Decubitus ulcer",
+        "Failure to thrive", "Altered mental status",
+    ]
+
+    # Target: ~3× the original diagnosis count (capped by available extras)
+    target_count = min(len(dx_items) * 3, len(dx_items) + len(generic_extras))
+    target_count = max(target_count, min(len(dx_items) + 5, len(dx_items) + len(generic_extras)))
+    inflated = list(dx_items)
+    extras_pool = list(generic_extras)
+    rng.shuffle(extras_pool)
+    for extra in extras_pool:
+        if len(inflated) >= target_count:
+            break
+        if extra not in inflated:
+            inflated.append(extra)
+    rng.shuffle(inflated[1:])  # keep first Dx at top, shuffle rest
+
+    inflated_dx = "\n".join(f"{i}. {item}" for i, item in enumerate(inflated, 1))
+
+    # Rebuild answer with inflated Dx
+    result = (
+        chosen_answer[:dx_match.end()]
+        + inflated_dx + "\n\n"
+        + chosen_answer[hc_match.start():]
+    )
+    return result
+
+
 # Legacy functions kept for compatibility
 def generate_rejected_by_deletion(
     chosen_answer: str,
@@ -902,6 +981,7 @@ def convert_ds_to_logo(
     total_chunks_all = 0
     total_critical_all = 0
     total_chosen_len = 0
+    skipped_3section = 0
 
     for pid in matched_ids:
         # --- Read input CSV ---
@@ -926,6 +1006,14 @@ def convert_ds_to_logo(
 
         # --- Read gold summary (preloaded) ---
         chosen_answer = all_gold_answers[pid]
+
+        # --- Filter: require all 3 sections (Dx, HC, DI) to be non-empty ---
+        has_dx = bool(re.search(r'(?:^|\n)Diagnosis:\s*\n\s*\S', chosen_answer))
+        has_hc = bool(re.search(r'(?:^|\n)Brief Hospital Course:\s*\n\s*\S', chosen_answer))
+        has_di = bool(re.search(r'(?:^|\n)Discharge Instructions:\s*\n\s*\S', chosen_answer))
+        if not (has_dx and has_hc and has_di):
+            skipped_3section += 1
+            continue
 
         # --- Clinical significance scoring (v2, 5-layer) ---
         chunk_scores: List[float] = []
@@ -968,24 +1056,27 @@ def convert_ds_to_logo(
         total_critical_all += len(critical_chunks)
         total_chosen_len += len(chosen_answer)
 
-        # --- Generate rejected answers ---
-        # reject_1: delete clinical-entity-rich sentences + swap entities in remainder
-        rejected_1 = generate_rejected_by_critical_deletion_and_swap(chosen_answer, rng, deletion_ratio=0.35, num_swaps=4)
-        # reject_2: structural destruction + cross-patient contamination
+        # --- Generate rejected answers (3 types) ---
+        # reject_1: diagnosis inflation — trains against verbose diagnosis lists
+        rejected_1 = generate_rejected_by_dx_inflation(chosen_answer, rng)
+        # reject_2: delete critical-entity-rich sentences + entity swap
+        rejected_2 = generate_rejected_by_critical_deletion_and_swap(chosen_answer, rng, deletion_ratio=0.35, num_swaps=4)
+        # reject_3: structural destruction + cross-patient contamination
         cross_pid, cross_gold = rng.choice([(p, a) for p, a in all_gold_answers.items() if p != pid])
-        rejected_2 = generate_rejected_structural(chosen_answer, cross_gold, rng)
+        rejected_3 = generate_rejected_structural(chosen_answer, cross_gold, rng)
 
         # --- Build record ---
         record = {
             "all_ref_text": chunks,
-            "chunk_timestamps": chunk_timestamps,  # Unix timestamps for time-driven position encoding
+            "chunk_timestamps": chunk_timestamps,
             "combined_question": QUESTION_TEMPLATE,
             "final_answer": chosen_answer,
-            "prefix_a": rejected_1,
-            "suffix_a": rejected_2,
-            "label": chosen_answer,  # gold reference = chosen answer
+            "prefix_a": rejected_1,     # diagnosis inflation
+            "suffix_a": rejected_2,     # critical deletion + entity swap
+            "tertiary_a": rejected_3,   # structural destruction + cross-patient
+            "label": chosen_answer,
             "critical_chunks": critical_chunks,
-            "partial_critical_chunks": [],  # not used in current scoring
+            "partial_critical_chunks": [],
             "irrelevant_chunks": irrelevant_chunks,
         }
 
@@ -995,6 +1086,8 @@ def convert_ds_to_logo(
             test_records.append(record)
 
         report.matched_patients += 1
+
+    logger.info("Skipped %d patients missing Dx/HC/DI sections.", skipped_3section)
 
     # ---- 4. Compute report stats ----
     if report.matched_patients > 0:

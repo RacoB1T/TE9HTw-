@@ -149,9 +149,9 @@ class SimORPOTrainer(SimPOTrainer):
         metrics = {}
         prefix = "eval_" if train_eval == "eval" else ""
 
-        policy_chosen_logps, policy_rejected_logps1, policy_rejected_logps2, policy_chosen_logits, policy_rejected_logits1, policy_rejected_logits2 = self.concatenated_forward(model, batch)
+        policy_chosen_logps, policy_rejected_logps1, policy_rejected_logps2, policy_rejected_logps3, policy_chosen_logits, policy_rejected_logits1, policy_rejected_logits2, policy_rejected_logits3 = self.concatenated_forward(model, batch)
 
-        losses, chosen_rewards, rejected_rewards = self.simpo_loss(policy_chosen_logps, (policy_rejected_logps1 + policy_rejected_logps2) / 2)
+        losses, chosen_rewards, rejected_rewards = self.simpo_loss(policy_chosen_logps, (policy_rejected_logps1 + policy_rejected_logps2 + policy_rejected_logps3) / 3)
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
         loss = losses.mean()
@@ -176,9 +176,11 @@ class SimORPOTrainer(SimPOTrainer):
         metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu().item()
         metrics[f"{prefix}logps/rejected1"] = policy_rejected_logps1.detach().mean().cpu().item()
         metrics[f"{prefix}logps/rejected2"] = policy_rejected_logps2.detach().mean().cpu().item()
+        metrics[f"{prefix}logps/rejected3"] = policy_rejected_logps3.detach().mean().cpu().item()
         metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu().item()
         metrics[f"{prefix}logits/rejected1"] = policy_rejected_logits1.detach().mean().cpu().item()
         metrics[f"{prefix}logits/rejected2"] = policy_rejected_logits2.detach().mean().cpu().item()
+        metrics[f"{prefix}logits/rejected3"] = policy_rejected_logits3.detach().mean().cpu().item()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu().item()
         return loss, metrics
 
@@ -258,22 +260,25 @@ class LOGOTrainer(SimPOTrainer):
         chosen_logps, chosen_logits = self._forward_one_branch(model, batch, "chosen")
         rej1_logps, rej1_logits = self._forward_one_branch(model, batch, "reject_1")
         rej2_logps, rej2_logits = self._forward_one_branch(model, batch, "reject_2")
+        rej3_logps, rej3_logits = self._forward_one_branch(model, batch, "reject_3")
 
         return (chosen_logps,
                 rej1_logps,
                 rej2_logps,
+                rej3_logps,
                 chosen_logits,
                 rej1_logits,
-                rej2_logits, )
+                rej2_logits,
+                rej3_logits, )
 
     def get_batch_loss_metrics(self, model, batch, train_eval):
         """Compute the SimPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
         prefix = "eval_" if train_eval == "eval" else ""
 
-        policy_chosen_logps, policy_rejected_logps1, policy_rejected_logps2, policy_chosen_logits, policy_rejected_logits1, policy_rejected_logits2 = self.concatenated_forward(model, batch)
+        policy_chosen_logps, policy_rejected_logps1, policy_rejected_logps2, policy_rejected_logps3, policy_chosen_logits, policy_rejected_logits1, policy_rejected_logits2, policy_rejected_logits3 = self.concatenated_forward(model, batch)
 
-        losses, chosen_rewards, rejected_rewards = self.simpo_loss(policy_chosen_logps, (policy_rejected_logps1 + policy_rejected_logps2) / 2)
+        losses, chosen_rewards, rejected_rewards = self.simpo_loss(policy_chosen_logps, (policy_rejected_logps1 + policy_rejected_logps2 + policy_rejected_logps3) / 3)
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
         loss = losses.mean()
@@ -298,9 +303,11 @@ class LOGOTrainer(SimPOTrainer):
         metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu().item()
         metrics[f"{prefix}logps/rejected1"] = policy_rejected_logps1.detach().mean().cpu().item()
         metrics[f"{prefix}logps/rejected2"] = policy_rejected_logps2.detach().mean().cpu().item()
+        metrics[f"{prefix}logps/rejected3"] = policy_rejected_logps3.detach().mean().cpu().item()
         metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu().item()
         metrics[f"{prefix}logits/rejected1"] = policy_rejected_logits1.detach().mean().cpu().item()
         metrics[f"{prefix}logits/rejected2"] = policy_rejected_logits2.detach().mean().cpu().item()
+        metrics[f"{prefix}logits/rejected3"] = policy_rejected_logits3.detach().mean().cpu().item()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu().item()
         return loss, metrics
 

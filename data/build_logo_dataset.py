@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-EXPECTED_12_FIELDS = frozenset(
+EXPECTED_FIELDS = frozenset(
     {
         "chosen_input_ids",
         "chosen_attention_mask",
@@ -77,6 +77,10 @@ EXPECTED_12_FIELDS = frozenset(
         "reject_2_attention_mask",
         "reject_2_position_ids",
         "reject_2_labels",
+        "reject_3_input_ids",
+        "reject_3_attention_mask",
+        "reject_3_position_ids",
+        "reject_3_labels",
     }
 )
 
@@ -178,6 +182,7 @@ class NormalizedSample:
     chosen_answer: str
     rejected_answer_1: str
     rejected_answer_2: str
+    rejected_answer_3: str = ""
     label: str = ""
     chunk_timestamps: List[float] = field(default_factory=list)
     critical_chunks: List[dict] = field(default_factory=list)
@@ -409,7 +414,79 @@ class Qwen35PromptAdapter(PromptAdapter):
 # Prompt adapter registry
 # ---------------------------------------------------------------------------
 
+class Llama2PromptAdapter(PromptAdapter):
+    """Prompt adapter for Llama-2 Chat format.
+
+    Llama-2 uses::
+
+        <s>[INST] <<SYS>>
+        {system_message}
+        <</SYS>>
+
+        References:
+        [Chunk 1]
+        ...
+        Question:
+        {question} [/INST] {answer} </s>
+    """
+
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, system_message: str = DEFAULT_SYSTEM_MESSAGE):
+        super().__init__(tokenizer, system_message)
+        self.bos_id: int = tokenizer.bos_token_id or 1     # <s>
+        self.eos_id: int = tokenizer.eos_token_id or 2     # </s>
+
+    def build_prompt_parts(self, context_chunks: List[str], question: str) -> PromptParts:
+        tk = self.tokenizer
+        inst_tokens = tk.encode("[INST] ", add_special_tokens=False)
+        slash_inst_tokens = tk.encode(" [/INST] ", add_special_tokens=False)
+
+        # --- system ---
+        # <s> [INST] <<SYS>>\n{message}\n<</SYS>>\n\n
+        sys_text = "<<SYS>>\n" + self.system_message + "\n<</SYS>>\n\n"
+        system_tokens = (
+            [self.bos_id] + inst_tokens + tk.encode(sys_text, add_special_tokens=False)
+        )
+
+        # --- chunks ---
+        chunk_tokens = [
+            tk.encode(chunk_text, add_special_tokens=False)
+            for chunk_text in context_chunks
+        ]
+
+        # --- user framing ---
+        user_framing_tokens: List[List[int]] = []
+        for i in range(len(context_chunks) + 1):
+            if i == 0:
+                text = "References:\n[Chunk 1]\n"
+            elif i < len(context_chunks):
+                text = f"\n\n[Chunk {i + 1}]\n"
+            else:
+                text = f"\n\nQuestion:\n{question}"
+            user_framing_tokens.append(tk.encode(text, add_special_tokens=False))
+
+        # Append [/INST] to last framing
+        user_framing_tokens[-1] = user_framing_tokens[-1] + slash_inst_tokens
+
+        # --- assistant header (no extra token, answer starts right after [/INST]) ---
+        assistant_header_tokens: List[int] = []
+
+        return PromptParts(
+            system_tokens=system_tokens,
+            chunk_tokens=chunk_tokens,
+            user_framing_tokens=user_framing_tokens,
+            assistant_header_tokens=assistant_header_tokens,
+        )
+
+    def tokenize_answer(self, answer: str) -> List[int]:
+        tk = self.tokenizer
+        answer_ids = tk.encode(answer, add_special_tokens=False)
+        if not answer_ids or answer_ids[-1] != self.eos_id:
+            answer_ids.append(self.eos_id)
+        return answer_ids
+
+
 PROMPT_ADAPTERS = {
+    "llama-2": Llama2PromptAdapter,
     "llama-3": Llama3PromptAdapter,
     "qwen3.5": Qwen35PromptAdapter,
 }
@@ -589,6 +666,9 @@ class LogoDatasetBuilder:
                 item.get("suffix_a", item.get("siffix_a", ""))
             ).strip()
 
+            # tertiary_a: third rejected answer (diagnosis inflation or structural)
+            rejected_3 = str(item.get("tertiary_a", "")).strip()
+
             # Label (optional)
             label = str(item.get("label", "")).strip()
 
@@ -623,6 +703,7 @@ class LogoDatasetBuilder:
                     chosen_answer=chosen,
                     rejected_answer_1=rejected_1,
                     rejected_answer_2=rejected_2,
+                    rejected_answer_3=rejected_3,
                     label=label,
                     chunk_timestamps=chunk_ts,
                     critical_chunks=critical_chunks,
@@ -652,6 +733,8 @@ class LogoDatasetBuilder:
             return "empty_rejected_1"
         if not sample.rejected_answer_2:
             return "empty_rejected_2"
+        if not sample.rejected_answer_3:
+            return "empty_rejected_3"
 
         # Answer deduplication
         if self.deduplicate_answers:
@@ -744,10 +827,16 @@ class LogoDatasetBuilder:
             return chunk_tokens[: self.chunk_token_size]
         return chunk_tokens
 
-    def _control_answer_length(self, answer_tokens: List[int]) -> List[int]:
-        """Truncate answer to ``max_answer_tokens`` tokens."""
+    def _control_answer_length(self, answer_tokens: List[int], eos_id: int = None) -> List[int]:
+        """Truncate answer to ``max_answer_tokens`` tokens, preserving trailing EOS."""
         if len(answer_tokens) > self.max_answer_tokens:
-            return answer_tokens[: self.max_answer_tokens]
+            truncated = answer_tokens[: self.max_answer_tokens - 1]
+            # Always keep the last token if it looks like EOS (prevents model from never learning to stop)
+            if eos_id is not None and answer_tokens[-1] == eos_id:
+                truncated.append(eos_id)
+            else:
+                truncated.append(answer_tokens[self.max_answer_tokens - 1])
+            return truncated
         return answer_tokens
 
     def _compute_budget(self, pp: PromptParts) -> Tuple[int, int, int, int]:
@@ -768,7 +857,8 @@ class LogoDatasetBuilder:
         chosen_tokens: List[int],
         rejected_1_tokens: List[int],
         rejected_2_tokens: List[int],
-    ) -> Tuple[PromptParts, List[int], List[int], List[int]]:
+        rejected_3_tokens: List[int],
+    ) -> Tuple[PromptParts, List[int], List[int], List[int], List[int]]:
         """Ensure total length of every branch <= max_seq_length.
 
         Priority: truncate answers, then chunks, then (as last resort) question.
@@ -778,13 +868,13 @@ class LogoDatasetBuilder:
         chunk_total = sum(pp.chunk_lens)
 
         max_answer = max(
-            len(chosen_tokens), len(rejected_1_tokens), len(rejected_2_tokens)
+            len(chosen_tokens), len(rejected_1_tokens), len(rejected_2_tokens), len(rejected_3_tokens)
         )
 
         total = system_len + question_len + chunk_total + assistant_header_len + max_answer
 
         if total <= self.max_seq_length:
-            return pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens
+            return pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens, rejected_3_tokens
 
         # 1. Truncate answers
         overhead = total - self.max_seq_length
@@ -794,10 +884,11 @@ class LogoDatasetBuilder:
                 chosen_tokens = chosen_tokens[: max(1, len(chosen_tokens) - trim)]
                 rejected_1_tokens = rejected_1_tokens[: max(1, len(rejected_1_tokens) - trim)]
                 rejected_2_tokens = rejected_2_tokens[: max(1, len(rejected_2_tokens) - trim)]
+                rejected_3_tokens = rejected_3_tokens[: max(1, len(rejected_3_tokens) - trim)]
                 overhead -= trim
 
         if overhead <= 0:
-            return pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens
+            return pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens, rejected_3_tokens
 
         # 2. Truncate individual chunks
         for i in range(pp.num_chunks):
@@ -810,18 +901,17 @@ class LogoDatasetBuilder:
                 overhead -= trim
 
         if overhead <= 0:
-            return pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens
+            return pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens, rejected_3_tokens
 
         # 3. Last resort: truncate question framing (keep at least 10 tokens)
         if question_len > 10 and overhead > 0:
             trim = min(overhead, question_len - 10)
-            # Trim from the last framing segment (question text)
             last_framing = pp.user_framing_tokens[-1]
             if len(last_framing) > trim:
                 pp.user_framing_tokens[-1] = last_framing[: len(last_framing) - trim]
             overhead -= trim
 
-        return pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens
+        return pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens, rejected_3_tokens
 
     # ------------------------------------------------------------------
     # Single variant construction
@@ -849,22 +939,26 @@ class LogoDatasetBuilder:
         pp = self.prompt_adapter.build_prompt_parts(shared_chunks, sample.question)
 
         # 3. Tokenize and truncate answers
+        eos_id = self.prompt_adapter.eos_id
         chosen_tokens = self._control_answer_length(
-            self.prompt_adapter.tokenize_answer(sample.chosen_answer)
+            self.prompt_adapter.tokenize_answer(sample.chosen_answer), eos_id=eos_id
         )
         rejected_1_tokens = self._control_answer_length(
-            self.prompt_adapter.tokenize_answer(sample.rejected_answer_1)
+            self.prompt_adapter.tokenize_answer(sample.rejected_answer_1), eos_id=eos_id
         )
         rejected_2_tokens = self._control_answer_length(
-            self.prompt_adapter.tokenize_answer(sample.rejected_answer_2)
+            self.prompt_adapter.tokenize_answer(sample.rejected_answer_2), eos_id=eos_id
+        )
+        rejected_3_tokens = self._control_answer_length(
+            self.prompt_adapter.tokenize_answer(sample.rejected_answer_3), eos_id=eos_id
         )
 
         # 4. Control chunk lengths
         pp.chunk_tokens = [self._control_chunk_length(c) for c in pp.chunk_tokens]
 
         # 5. Overall length control
-        pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens = self._control_total_length(
-            pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens
+        pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens, rejected_3_tokens = self._control_total_length(
+            pp, chosen_tokens, rejected_1_tokens, rejected_2_tokens, rejected_3_tokens
         )
 
         # 6. Build position IDs preserving temporal order for clinical data.
@@ -1008,6 +1102,11 @@ class LogoDatasetBuilder:
         r2_attention_mask = prefix_attn + [1] * len(rejected_2_tokens)
         r2_labels = [-100] * len(prefix_ids) + rejected_2_tokens
 
+        r3_position_ids = _build_branch_positions(len(rejected_3_tokens))
+        r3_input_ids = prefix_ids + rejected_3_tokens
+        r3_attention_mask = prefix_attn + [1] * len(rejected_3_tokens)
+        r3_labels = [-100] * len(prefix_ids) + rejected_3_tokens
+
         # 11. Per-sample validation
         result = {
             "chosen_input_ids": chosen_input_ids,
@@ -1022,6 +1121,10 @@ class LogoDatasetBuilder:
             "reject_2_attention_mask": r2_attention_mask,
             "reject_2_position_ids": r2_position_ids,
             "reject_2_labels": r2_labels,
+            "reject_3_input_ids": r3_input_ids,
+            "reject_3_attention_mask": r3_attention_mask,
+            "reject_3_position_ids": r3_position_ids,
+            "reject_3_labels": r3_labels,
         }
 
         if not self._validate_variant(result, sample.sample_id):
@@ -1034,7 +1137,7 @@ class LogoDatasetBuilder:
         result["_position_strategy"] = strategy
         result["_real_token_length"] = len(chosen_input_ids)
         result["_max_position_id"] = max(
-            max(chosen_position_ids), max(r1_position_ids), max(r2_position_ids)
+            max(chosen_position_ids), max(r1_position_ids), max(r2_position_ids), max(r3_position_ids)
         )
         result["_num_chunks"] = pp.num_chunks
         result["_chosen_answer_length"] = len(chosen_tokens)
@@ -1048,18 +1151,18 @@ class LogoDatasetBuilder:
         try:
             # 1. Field completeness
             actual_keys = {k for k in result if not k.startswith("_")}
-            if actual_keys != EXPECTED_12_FIELDS:
+            if actual_keys != EXPECTED_FIELDS:
                 logger.warning(
                     "%s: expected 12 fields, got %d. Extra: %s, Missing: %s",
                     sample_id,
                     len(actual_keys),
-                    actual_keys - EXPECTED_12_FIELDS,
-                    EXPECTED_12_FIELDS - actual_keys,
+                    actual_keys - EXPECTED_FIELDS,
+                    EXPECTED_FIELDS - actual_keys,
                 )
                 return False
 
             # 2. Length consistency per branch
-            for prefix in ("chosen", "reject_1", "reject_2"):
+            for prefix in ("chosen", "reject_1", "reject_2", "reject_3"):
                 ids_len = len(result[f"{prefix}_input_ids"])
                 attn_len = len(result[f"{prefix}_attention_mask"])
                 pos_len = len(result[f"{prefix}_position_ids"])
@@ -1204,7 +1307,7 @@ class LogoDatasetBuilder:
         if records:
             ds = Dataset.from_list(records)
         else:
-            ds = Dataset.from_dict({k: [] for k in EXPECTED_12_FIELDS})
+            ds = Dataset.from_dict({k: [] for k in EXPECTED_FIELDS})
 
         return ds, metadata
 
