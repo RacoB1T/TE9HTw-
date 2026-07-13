@@ -267,19 +267,17 @@ class Llama3PromptAdapter(PromptAdapter):
             for chunk_text in context_chunks
         ]
 
-        # --- user framing (text between chunks) ---
-        # Structure:
-        #   framing[0]:  "References:\n[Chunk 1]\n"
-        #   framing[1]:  "\n\n[Chunk 2]\n"
-        #   framing[2]:  "\n\n[Chunk 3]\n"
+        # --- user framing (text between chunks, no [Chunk N] labels) ---
+        #   framing[0]:  "References:\n"
+        #   framing[1]:  "\n\n"
         #   ...
         #   framing[N]:  "\n\nQuestion:\n{question}"
         user_framing_tokens: List[List[int]] = []
         for i in range(len(context_chunks) + 1):
             if i == 0:
-                text = "References:\n[Chunk 1]\n"
+                text = "References:\n"
             elif i < len(context_chunks):
-                text = f"\n\n[Chunk {i + 1}]\n"
+                text = "\n\n"
             else:
                 text = f"\n\nQuestion:\n{question}"
             user_framing_tokens.append(tk.encode(text, add_special_tokens=False))
@@ -372,9 +370,9 @@ class Qwen35PromptAdapter(PromptAdapter):
         user_framing_tokens: List[List[int]] = []
         for i in range(len(context_chunks) + 1):
             if i == 0:
-                text = "References:\n[Chunk 1]\n"
+                text = "References:\n"
             elif i < len(context_chunks):
-                text = f"\n\n[Chunk {i + 1}]\n"
+                text = "\n\n"
             else:
                 text = f"\n\nQuestion:\n{question}"
             user_framing_tokens.append(tk.encode(text, add_special_tokens=False))
@@ -457,9 +455,9 @@ class Llama2PromptAdapter(PromptAdapter):
         user_framing_tokens: List[List[int]] = []
         for i in range(len(context_chunks) + 1):
             if i == 0:
-                text = "References:\n[Chunk 1]\n"
+                text = "References:\n"
             elif i < len(context_chunks):
-                text = f"\n\n[Chunk {i + 1}]\n"
+                text = "\n\n"
             else:
                 text = f"\n\nQuestion:\n{question}"
             user_framing_tokens.append(tk.encode(text, add_special_tokens=False))

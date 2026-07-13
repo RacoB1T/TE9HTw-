@@ -661,19 +661,605 @@ def _extract_and_swap_entities(text: str, rng: random.Random, num_swaps: int = 3
 
 
 # ---------------------------------------------------------------------------
-# Rejected answer generation
+# Rejected answer generation (v2 — redesigned for balanced difficulty)
+# ---------------------------------------------------------------------------
+#
+# Three complementary strategies, all producing ~75-92% token overlap with
+# the chosen answer.  Each tests a different capability:
+#
+#   Reject 1 — Numerical & Temporal Precision Corruption
+#   Reject 2 — Clinical Event Substitution & Omission
+#   Reject 3 — Section Attribution Error & Cross-Patient Contamination
+#
+# Design principles:
+#   1. Equal difficulty → similar expected logps → all 3 provide gradient
+#   2. Full-text coverage → every reject touches all 3 sections
+#   3. Requires context → cannot distinguish without reading input chunks
+#   4. Clinically realistic → mimics errors real LLMs / fatigued clinicians make
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers: section parsing
 # ---------------------------------------------------------------------------
 
+_SECTION_HEADERS = [
+    ("Diagnosis", re.compile(r'(?:^|\n)Diagnosis:\s*\n', re.IGNORECASE)),
+    ("Brief Hospital Course", re.compile(r'(?:^|\n)Brief Hospital Course:\s*\n', re.IGNORECASE)),
+    ("Discharge Instructions", re.compile(r'(?:^|\n)Discharge Instructions:\s*\n', re.IGNORECASE)),
+]
+
+
+def _parse_sections(text: str) -> Dict[str, str]:
+    """Parse chosen answer into the three canonical sections.
+
+    Returns ``{"Diagnosis": ..., "Brief Hospital Course": ..., "Discharge Instructions": ...}``.
+    """
+    sections: Dict[str, str] = {}
+    positions: List[Tuple[str, int, int]] = []  # (name, start, end)
+
+    for name, pat in _SECTION_HEADERS:
+        m = pat.search(text)
+        if m:
+            positions.append((name, m.start(), m.end()))
+
+    positions.sort(key=lambda x: x[1])
+
+    for i, (name, _s, header_end) in enumerate(positions):
+        if i + 1 < len(positions):
+            body_end = positions[i + 1][1]
+        else:
+            body_end = len(text)
+        sections[name] = text[header_end:body_end].strip()
+
+    # Fill missing sections with empty string
+    for name, _ in _SECTION_HEADERS:
+        if name not in sections:
+            sections[name] = ""
+
+    return sections
+
+
+def _split_sentences(text: str, min_len: int = 10) -> List[str]:
+    """Split text into sentences, keeping clinically-relevant boundaries."""
+    raw = re.split(r'(?<=[.!?])\s+|\n\n+', text)
+    return [s.strip() for s in raw if len(s.strip()) >= min_len]
+
+
+# ---------------------------------------------------------------------------
+# Reject 1: Numerical & Temporal Precision Corruption
+# ---------------------------------------------------------------------------
+
+# Patterns for numerical values in clinical text, grouped by type.
+_NUMERICAL_PATTERNS: List[Tuple[str, re.Pattern, float, float]] = [
+    # (category, pattern, min_scale, max_scale)  — scale factors for distortion
+    #
+    # Lab values with units
+    ("lab", re.compile(
+        r'\b(?:hematocrit|hct|hgb|hemoglobin)\s*(\d+\.?\d*)', re.IGNORECASE), 0.75, 1.25),
+    ("lab", re.compile(
+        r'\b(?:wbc|white blood cell(?:\s*count)?)\s*(\d+\.?\d*)', re.IGNORECASE), 0.70, 1.30),
+    ("lab", re.compile(
+        r'\bplatelet(?:s|\s*count)?\s*([\d,]+)', re.IGNORECASE), 0.70, 1.30),
+    ("lab", re.compile(
+        r'\b(?:sodium|potassium|chloride|CO2|bun|creatinine|glucose|calcium|magnesium|'
+        r'phosphorous|albumin|bilirubin|inr|ptt|pt\b|INR)\s*(\d+\.?\d*)', re.IGNORECASE), 0.80, 1.20),
+    ("lab", re.compile(
+        r'\b(?:troponin|ck-mb|ldh|lactate|amylase|lipase)\s*(\d+\.?\d*)', re.IGNORECASE), 0.70, 1.35),
+    # Vital signs
+    ("vital", re.compile(
+        r'\bheart\s*rate\s*(\d+)', re.IGNORECASE), 0.85, 1.15),
+    ("vital", re.compile(
+        r'\bblood\s*pressure\s*(\d+)/(\d+)', re.IGNORECASE), 0.85, 1.15),
+    ("vital", re.compile(
+        r'\b(?:temperature|temp)\s*(\d+\.?\d*)', re.IGNORECASE), 0.97, 1.03),
+    ("vital", re.compile(
+        r'\b(?:respiratory\s*rate|RR)\s*(\d+)', re.IGNORECASE), 0.80, 1.20),
+    ("vital", re.compile(
+        r'\b(?:oxygen\s*saturation|O2\s*sat|SpO2)\s*(\d+\.?\d*)', re.IGNORECASE), 0.92, 1.05),
+    # Drug dosages
+    ("dose", re.compile(
+        r'(\d+\.?\d*)\s*(?:mg|mcg|g|units?|meq|mL|cc)\b', re.IGNORECASE), 0.50, 2.0),
+    ("dose", re.compile(
+        r'(\d+\.?\d*)\s*(?:mcg/kg/min|mg/kg|units/kg/hr)', re.IGNORECASE), 0.60, 1.50),
+    # Time durations
+    ("duration", re.compile(
+        r'\b(\d+)\s*(?:minutes?|mins?)\b', re.IGNORECASE), 0.60, 1.50),
+    ("duration", re.compile(
+        r'\b(\d+\.?\d*)\s*(?:hours?|hrs?)\b', re.IGNORECASE), 0.65, 1.45),
+    ("duration", re.compile(
+        r'\b(\d+)\s*(?:days?|weeks?)\b', re.IGNORECASE), 0.70, 1.40),
+    # Counts / measurements
+    ("count", re.compile(
+        r'\b(?:cross-clamp|bypass|circ\s*arrest)\s*time\s*(?:was\s*)?(\d+)', re.IGNORECASE), 0.70, 1.35),
+    ("count", re.compile(
+        r'\b(?:weight|weighs?)\s*(?:preoperatively\s*)?(?:was\s*)?(\d+\.?\d*)\s*(?:kg|kilograms?)', re.IGNORECASE), 0.90, 1.10),
+]
+
+
+def _distort_number(
+    text: str, rng: random.Random, num_distortions: int = 12
+) -> str:
+    """Distort *num_distortions* numerical values across the full text.
+
+    Each matched number is scaled by a category-appropriate random factor,
+    rounded to a clinically plausible precision (int for counts, 1dp for labs).
+    Handles commas in numbers (e.g. "219,000") and multi-group patterns (e.g. BP).
+    """
+    # Collect all matches with their category info
+    all_matches: List[Tuple[int, int, str, float, float, List[str]]] = []
+    for cat, pat, lo, hi in _NUMERICAL_PATTERNS:
+        for m in pat.finditer(text):
+            # Flatten all captured groups into a list of numeric strings
+            captured = [g for g in m.groups() if g is not None]
+            if captured:
+                all_matches.append((m.start(), m.end(), cat, lo, hi, captured))
+
+    if not all_matches:
+        return text
+
+    # Select num_distortions uniformly across categories
+    rng.shuffle(all_matches)
+    selected = all_matches[:min(num_distortions, len(all_matches))]
+    # Sort in reverse order so replacements don't shift indices
+    selected.sort(key=lambda x: x[0], reverse=True)
+
+    result = text
+    for start, end, cat, lo, hi, captured_nums in selected:
+        original_span = result[start:end]
+        new_span = original_span
+        for num_str in captured_nums:
+            # Handle comma-formatted numbers (e.g. "219,000")
+            clean_num = num_str.replace(',', '')
+            try:
+                val = float(clean_num)
+            except ValueError:
+                continue
+            # Pick a scale factor — avoid 1.0 ± 0.04 to prevent no-ops
+            for _attempt in range(50):  # safety limit
+                scale = rng.uniform(lo, hi)
+                if abs(scale - 1.0) > 0.04:
+                    break
+            new_val = val * scale
+            # Round to clinically appropriate precision
+            if '.' in clean_num:
+                decimals = len(clean_num.split('.')[1])
+                new_val_str = f"{new_val:.{decimals}f}"
+            elif cat in ("count", "duration") or val >= 100:
+                new_val_str = str(int(round(new_val)))
+            else:
+                new_val_str = f"{new_val:.1f}"
+            # Replace only the first occurrence of this specific number in the span
+            new_span = new_span.replace(num_str, new_val_str, 1)
+        result = result[:start] + new_span + result[end:]
+
+    return result
+
+
+# Temporal marker patterns
+_TEMPORAL_PATTERNS: List[re.Pattern] = [
+    re.compile(r'\bpost(?:-|\s*)operative\s*day\s*(?:#?\s*)(\d+)', re.IGNORECASE),
+    re.compile(r'\bPOD\s*#?\s*(\d+)', re.IGNORECASE),
+    re.compile(r'\bhospital\s*day\s*(\d+)', re.IGNORECASE),
+    re.compile(r'\b(?:on|by)\s*day\s*(\d+)', re.IGNORECASE),
+    re.compile(r'\bday\s*(\d+)\s*(?:of|post)', re.IGNORECASE),
+]
+
+
+def _distort_temporal(text: str, rng: random.Random) -> str:
+    """Shift temporal markers by ±1-2 days."""
+    result = text
+    for pat in _TEMPORAL_PATTERNS:
+        for m in list(pat.finditer(result)):
+            day = int(m.group(1))
+            shift = rng.choice([-2, -1, 1, 2])
+            new_day = max(1, day + shift)
+            if new_day != day:
+                result = result[:m.start(1)] + str(new_day) + result[m.end(1):]
+    return result
+
+
+def generate_rejected_numerical_temporal(
+    chosen_answer: str,
+    rng: random.Random,
+) -> str:
+    """Reject 1: Corrupt numerical values and temporal markers throughout the text.
+
+    Targets 8-15 numerical distortions + 1-3 temporal shifts across all three
+    sections.  The text reads fluently — the model MUST check context chunks
+    to verify numerical precision.
+
+    Expected token overlap: ~92-96%.
+    """
+    result = _distort_number(chosen_answer, rng, num_distortions=rng.randint(8, 15))
+    result = _distort_temporal(result, rng)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Reject 2: Clinical Event Substitution & Omission
+# ---------------------------------------------------------------------------
+
+# Procedure substitution patterns (broader than entity table — replaces entire phrases)
+_PROCEDURE_SUBSTITUTIONS: List[Tuple[str, str]] = [
+    # Cardiac
+    (r'\bmitral valve replacement\b', 'mitral valve repair'),
+    (r'\bCABG\s*(?:x|times?\s*)(\d+)', 'CABG x{}'),
+    (r'\bcoronary artery bypass grafting\b', 'coronary artery stenting'),
+    (r'\bLIMA to (?:the )?LAD\b', 'SVG to LAD'),
+    (r'\bAVR\b', 'aortic valvuloplasty'),
+    (r'\bdirect current cardioversion\b', 'pharmacologic cardioversion'),
+    (r'\bcardiac catheterization\b', 'stress echocardiography'),
+    # General surgery
+    (r'\bexploratory laparotomy\b', 'diagnostic laparoscopy'),
+    (r'\bcholecystectomy\b', 'ERCP with sphincterotomy'),
+    (r'\bappendectomy\b', 'antibiotic management'),
+    (r'\bendarterectomy\b', 'angioplasty with stent'),
+    # Interventions
+    (r'\bintubation\b', 'BiPAP initiation'),
+    (r'\bextubation\b', 'spontaneous breathing trial'),
+    (r'\bchest tube(?:s)? (?:were |was )?removed\b', 'chest tubes were maintained on suction'),
+    (r'\bdialysis\b', 'aggressive diuresis'),
+    (r'\bcardioversion\b', 'rate control with beta blockade'),
+    # Diagnostics
+    (r'\bCT (?:scan|angiogram)\b', 'MRI'),
+    (r'\bultrasound\b', 'CT with contrast'),
+    (r'\bechocardiogram\b', 'cardiac MRI'),
+    (r'\bEGD\b', 'upper GI series'),
+    (r'\bcolonoscopy\b', 'CT colonography'),
+]
+
+# Complication / finding templates for plausible fabrication
+_COMPLICATION_TEMPLATES = [
+    "The patient developed acute kidney injury with creatinine rising to {val}, which resolved with conservative management.",
+    "On POD#{day}, the patient experienced a brief episode of hypotension requiring a fluid bolus of {val} mL.",
+    "Blood cultures drawn on hospital day {day} grew {org}, and the patient was started on appropriate antibiotics.",
+    "The patient had a transient episode of altered mental status on POD#{day}, which resolved spontaneously.",
+    "A new oxygen requirement of {val}L via nasal cannula developed on day {day}, which resolved over 48 hours.",
+    "Post-operative chest X-ray showed a small pleural effusion that required no intervention.",
+    "The patient developed a superficial wound hematoma that was managed conservatively.",
+    "A fall risk assessment was completed and the patient was placed on fall precautions.",
+]
+
+
+def _score_sentence_clinical(sent: str) -> int:
+    """Score a sentence by clinical information density."""
+    score = 0
+    for entity in CLINICAL_ENTITY_TABLE:
+        if re.search(r'\b' + re.escape(entity) + r'\b', sent, re.IGNORECASE):
+            score += 1
+    # Bonus for procedure mentions
+    for orig, _ in _PROCEDURE_SUBSTITUTIONS:
+        if re.search(orig, sent, re.IGNORECASE):
+            score += 3
+    # Bonus for numerical measurements
+    score += len(re.findall(r'\d+\.?\d*\s*(?:mg|mcg|g|mL|min|hr|day|kg|mmHg)', sent))
+    return score
+
+
+def _substitute_procedure(sent: str, rng: random.Random) -> str:
+    """Replace one procedure mention in the sentence with an alternative."""
+    result = sent
+    found = []
+    for pat_str, repl_template in _PROCEDURE_SUBSTITUTIONS:
+        for m in re.finditer(pat_str, sent, re.IGNORECASE):
+            found.append((m.start(), m.end(), m.group(), pat_str, repl_template))
+    if not found:
+        return sent
+    rng.shuffle(found)
+    start, end, matched, _, repl_template = found[0]
+    # If the replacement has a {} placeholder (e.g. "CABG x{}"), fill it
+    repl = repl_template
+    if '{}' in repl:
+        num_match = re.search(r'\d+', matched)
+        fill = num_match.group() if num_match else '2'
+        repl = repl.format(fill)
+    result = result[:start] + repl + result[end:]
+    return result
+
+
+def generate_rejected_event_substitution(
+    chosen_answer: str,
+    rng: random.Random,
+) -> str:
+    """Reject 2: Substitute clinical events and add fabricated complications.
+
+    Brief Hospital Course: replace 2-3 procedures + insert 1-2 fabricated events
+    Diagnosis: add 2-3 spurious diagnoses + remove 1 real one
+    Discharge Instructions: swap 1-2 medication names
+
+    Expected token overlap: ~75-85%.
+    """
+    sections = _parse_sections(chosen_answer)
+    if not sections.get("Brief Hospital Course"):
+        # Fallback: full-text entity swap
+        return _extract_and_swap_entities(chosen_answer, rng, num_swaps=6)
+
+    # --- Brief Hospital Course ---
+    hc_text = sections["Brief Hospital Course"]
+    hc_sentences = _split_sentences(hc_text, min_len=15)
+
+    if len(hc_sentences) >= 5:
+        # Score and select top-entity-density sentences
+        scored = [(i, _score_sentence_clinical(s)) for i, s in enumerate(hc_sentences)]
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # a) Substitute 2-3 procedures in top-scoring sentences
+        num_proc_subs = min(rng.randint(2, 3), len(scored))
+        for idx, _score_val in scored[:num_proc_subs]:
+            hc_sentences[idx] = _substitute_procedure(hc_sentences[idx], rng)
+
+        # b) Insert 1-2 fabricated complications at plausible positions
+        num_fab = rng.randint(1, 2)
+        fab_templates = rng.sample(_COMPLICATION_TEMPLATES, min(num_fab, len(_COMPLICATION_TEMPLATES)))
+        for tmpl in fab_templates:
+            day = rng.randint(2, 10)
+            val = rng.choice([500, 1000, 1500, 2, 3, 4])
+            org = rng.choice(["CoNS", "E. coli", "Klebsiella", "Enterococcus"])
+            fab_text = tmpl.format(day=day, val=val, org=org)
+            insert_pos = rng.randint(max(1, len(hc_sentences) // 3), len(hc_sentences))
+            hc_sentences.insert(insert_pos, fab_text)
+
+        # c) Delete 1-2 low-scoring sentences
+        if len(hc_sentences) > 5:
+            low_scored = sorted(scored, key=lambda x: x[1])
+            num_del = rng.randint(1, 2)
+            del_indices = set(idx for idx, _ in low_scored[:num_del])
+            hc_sentences = [s for i, s in enumerate(hc_sentences) if i not in del_indices]
+
+        new_hc = " ".join(hc_sentences)
+    else:
+        new_hc = hc_text
+
+    # --- Diagnosis ---
+    dx_text = sections.get("Diagnosis", "")
+    dx_items = [l.strip() for l in dx_text.split('\n') if l.strip()]
+    dx_clean = []
+    for line in dx_items:
+        item = re.sub(r'^\d+\.\s*|[-•]\s*', '', line).strip()
+        if item:
+            dx_clean.append(item)
+
+    if len(dx_clean) >= 3:
+        # Add 2-3 diagnoses not in the original
+        spurious_pool = [
+            "Hypokalemia", "Hypomagnesemia", "Anemia of chronic disease",
+            "Acute kidney injury, resolved", "Leukocytosis",
+            "Thrombocytopenia", "Hyperglycemia", "Metabolic alkalosis",
+            "Urinary tract infection", "Delirium, resolved",
+            "Failure to thrive", "Dehydration", "Hypoalbuminemia",
+            "Elevated transaminases", "Coagulopathy",
+        ]
+        existing_lower = {d.lower() for d in dx_clean}
+        candidates = [d for d in spurious_pool if d.lower() not in existing_lower]
+        rng.shuffle(candidates)
+        num_add = min(rng.randint(2, 3), len(candidates))
+        for d in candidates[:num_add]:
+            dx_clean.append(d)
+        # Remove 1 real diagnosis (not the first)
+        if len(dx_clean) > 3:
+            del_idx = rng.randint(1, len(dx_clean) - 1)
+            dx_clean.pop(del_idx)
+        rng.shuffle(dx_clean[1:])  # shuffle non-primary Dx
+        new_dx = "\n".join(f"{i}. {item}" for i, item in enumerate(dx_clean, 1))
+    else:
+        new_dx = dx_text
+
+    # --- Discharge Instructions ---
+    di_text = sections.get("Discharge Instructions", "")
+    new_di = _extract_and_swap_entities(di_text, rng, num_swaps=rng.randint(2, 4))
+
+    # --- Reassemble ---
+    return _reassemble_answer(chosen_answer, sections, new_dx, new_hc, new_di)
+
+
+# ---------------------------------------------------------------------------
+# Reject 3: Section Attribution Error & Cross-Patient Contamination
+# ---------------------------------------------------------------------------
+
+
+def _find_thematic_cross_sentences(
+    target_text: str,
+    cross_gold: str,
+    rng: random.Random,
+    num_sentences: int = 3,
+) -> List[str]:
+    """Find sentences from *cross_gold* that are thematically similar to *target_text*.
+
+    Uses unigram overlap (ROUGE-1) to match, then picks top candidates.
+    This produces more subtle cross-contamination than random injection.
+    """
+    target_words = set(target_text.lower().split())
+    cross_sentences = _split_sentences(cross_gold, min_len=15)
+
+    if len(cross_sentences) <= num_sentences:
+        return cross_sentences
+
+    scored = []
+    for s in cross_sentences:
+        s_words = set(s.lower().split())
+        if not s_words:
+            scored.append((0.0, s))
+            continue
+        overlap = len(target_words & s_words) / len(s_words)
+        scored.append((overlap, s))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    # Take from top-third to avoid exact matches but get thematically close ones
+    pool = scored[:max(num_sentences * 3, len(scored) // 3)]
+    rng.shuffle(pool)
+    return [s for _, s in pool[:num_sentences]]
+
+
+def generate_rejected_section_contamination(
+    chosen_answer: str,
+    cross_patient_gold: str,
+    rng: random.Random,
+) -> str:
+    """Reject 3: Corrupt section boundaries + thematically-matched cross-patient injection.
+
+    1. Move 1-2 sentences from Hospital Course narrative into Diagnosis section
+    2. Move 1 diagnosis-like statement into Hospital Course
+    3. Inject 2-3 thematically-matched sentences from another patient
+    4. Create a medication inconsistency (drug in Course not in Instructions)
+    5. Maintains overall structure — no random sentence shuffling
+
+    Expected token overlap: ~75-85%.
+    """
+    sections = _parse_sections(chosen_answer)
+    hc_text = sections.get("Brief Hospital Course", "")
+    dx_text = sections.get("Diagnosis", "")
+    di_text = sections.get("Discharge Instructions", "")
+
+    hc_sentences = _split_sentences(hc_text, min_len=15)
+    dx_items = [l.strip() for l in dx_text.split('\n') if l.strip() and len(l.strip()) > 5]
+
+    # --- 1. Move HC sentences → Diagnosis ---
+    if len(hc_sentences) >= 4 and len(dx_items) >= 3:
+        # Pick 1-2 sentences from HC that read like diagnostic statements
+        candidates = []
+        for i, s in enumerate(hc_sentences):
+            if re.search(r'\b(?:diagnosed|noted to have|found to have|consistent with|'
+                         r'evidence of|significant for|revealed)\b', s, re.IGNORECASE):
+                candidates.append(i)
+        if not candidates and len(hc_sentences) > 2:
+            candidates = [rng.randint(1, len(hc_sentences) - 1)]
+
+        if candidates:
+            num_move = min(rng.randint(1, 2), len(candidates))
+            move_indices = rng.sample(candidates, num_move)
+            moved_sentences = []
+            for idx in sorted(move_indices, reverse=True):
+                moved_sentences.append(hc_sentences.pop(idx))
+            # Add as new "diagnoses" (convert sentence to Dx-like statement)
+            for s in moved_sentences:
+                short = re.sub(r'(?<=[.!?])\s+.*', '', s)[:80]
+                dx_items.append(f"  - {short}")
+            rng.shuffle(dx_items[1:])
+
+        new_dx = "\n".join(dx_items)
+    else:
+        new_dx = dx_text
+
+    # --- 2. Move a Dx statement → HC (as narrative) ---
+    new_hc_parts = list(hc_sentences)
+    if len(dx_items) >= 4 and len(new_hc_parts) >= 3:
+        # Take one non-primary Dx and phrase it as a finding
+        dx_to_move = dx_items[rng.randint(1, len(dx_items) - 1)]
+        dx_clean = re.sub(r'^\d+\.\s*|[-•]\s*', '', dx_to_move).strip()
+        narrative = f"The patient carried a diagnosis of {dx_clean}."
+        insert_pos = rng.randint(1, len(new_hc_parts))
+        new_hc_parts.insert(insert_pos, narrative)
+
+    new_hc = " ".join(new_hc_parts)
+
+    # --- 3. Thematically-matched cross-patient injection ---
+    if cross_patient_gold and cross_patient_gold != chosen_answer:
+        thematic_sents = _find_thematic_cross_sentences(
+            hc_text, cross_patient_gold, rng, num_sentences=rng.randint(2, 3)
+        )
+        if thematic_sents and len(new_hc_parts) >= 4:
+            for s in thematic_sents:
+                pos = rng.randint(1, len(new_hc_parts))
+                new_hc_parts.insert(pos, s.strip())
+            new_hc = " ".join(new_hc_parts)
+
+    # --- 4. Medication inconsistency ---
+    new_di = di_text
+    meds_in_hc = set()
+    for m in re.finditer(r'\b([A-Z][a-z]+(?:in|ol|ide|am|cin|one|ium|ate|ine|sin)\b)',
+                         hc_text):
+        meds_in_hc.add(m.group(1))
+    meds_in_di = set()
+    for m in re.finditer(r'\b([A-Z][a-z]+(?:in|ol|ide|am|cin|one|ium|ate|ine|sin)\b)',
+                         di_text):
+        meds_in_di.add(m.group(1))
+
+    # If a medication mentioned in HC is missing from DI, that's an inconsistency
+    # (already present in the data — no need to add more)
+
+    return _reassemble_answer(chosen_answer, sections, new_dx, new_hc, new_di)
+
+
+# ---------------------------------------------------------------------------
+# Answer reassembly
+# ---------------------------------------------------------------------------
+
+def _reassemble_answer(
+    original: str,
+    sections: Dict[str, str],
+    new_dx: str,
+    new_hc: str,
+    new_di: str,
+) -> str:
+    """Rebuild the answer with modified sections, preserving original header text.
+
+    Strategy: find each section header in the original, keep the header text
+    verbatim, and replace only the body content between headers.
+    """
+    # Find header positions in original
+    header_positions: List[Tuple[str, int, int]] = []  # (name, header_start, header_end)
+    for name, pat in _SECTION_HEADERS:
+        m = pat.search(original)
+        if m:
+            header_positions.append((name, m.start(), m.end()))
+    header_positions.sort(key=lambda x: x[1])
+
+    if len(header_positions) < 2:
+        # Cannot parse — build from scratch
+        return f"Diagnosis:\n{new_dx}\n\nBrief Hospital Course:\n{new_hc}\n\nDischarge Instructions:\n{new_di}\n"
+
+    replacements = {
+        "Diagnosis": new_dx,
+        "Brief Hospital Course": new_hc,
+        "Discharge Instructions": new_di,
+    }
+
+    # Build the result: for each section, emit the header + new body
+    result_parts: List[str] = []
+
+    # Text before the first header (usually empty for well-formed summaries)
+    first_hdr_start = header_positions[0][1]
+    prefix = original[:first_hdr_start]
+    if prefix.strip():
+        result_parts.append(prefix)
+
+    for i, (name, hdr_start, hdr_end) in enumerate(header_positions):
+        header_text = original[hdr_start:hdr_end]
+        body = replacements.get(name, "")
+        result_parts.append(header_text)
+        result_parts.append(body)
+        # Add the gap between this section's body end and next section's header
+        if i + 1 < len(header_positions):
+            next_hdr_start = header_positions[i + 1][1]
+            # Find where the current section body ends in original
+            # (the gap between sections — usually "\n\n" or similar)
+            body_end_in_original = next_hdr_start
+            # Walk backwards from next header to find the separator
+            sep_start = hdr_end
+            # The gap is the whitespace between where body ends and next header begins
+            result_parts.append("\n\n")
+
+    # Trailing text after last section
+    last_hdr_start = header_positions[-1][1]
+    # Find end of last body in original
+    if len(header_positions) >= 2:
+        # Last body ends where next header would be, or at end of text
+        pass  # Handled by the loop above
+    result_parts.append("\n")
+
+    return "".join(result_parts)
+
+
+# ---------------------------------------------------------------------------
+# Legacy wrappers — kept for interface compatibility
+# ---------------------------------------------------------------------------
 
 def generate_rejected_by_entity_swap(
     chosen_answer: str,
     rng: random.Random,
     num_swaps: int = 3,
 ) -> str:
-    """Swap clinical entities to create a factually-wrong but structurally-similar answer.
-
-    The model must check context chunks to distinguish correct from incorrect.
-    """
+    """Legacy wrapper — now delegates to new Reject 2 lite."""
     return _extract_and_swap_entities(chosen_answer, rng, num_swaps=num_swaps)
 
 
@@ -683,37 +1269,8 @@ def generate_rejected_by_critical_deletion_and_swap(
     deletion_ratio: float = 0.35,
     num_swaps: int = 4,
 ) -> str:
-    """Delete sentences with rich clinical entities, then swap entities in the rest.
-
-    This combines two signals:
-    - Missing critical information (sentence deletion)
-    - Factually wrong content (entity swap)
-    Resulting overlap: ~50-70%.
-    """
-    sentences = re.split(r'(?<=[.!?])\s+', chosen_answer)
-    if len(sentences) <= 3:
-        return _extract_and_swap_entities(chosen_answer, rng, num_swaps=num_swaps)
-
-    # Score sentences by clinical entity density (how many replaceable entities)
-    scored = []
-    for i, sent in enumerate(sentences):
-        count = 0
-        for entity in CLINICAL_ENTITY_TABLE:
-            if re.search(r'\b' + re.escape(entity) + r'\b', sent, re.IGNORECASE):
-                count += 1
-        scored.append((i, count, sent))
-
-    # Delete high-entity sentences (these carry the most clinical information)
-    scored.sort(key=lambda x: x[1], reverse=True)
-    num_to_delete = max(1, int(len(sentences) * deletion_ratio))
-    indices_to_delete = set(idx for idx, _, _ in scored[:num_to_delete])
-
-    kept = [s for i, s in enumerate(sentences) if i not in indices_to_delete]
-    result = " ".join(kept)
-
-    # Then swap entities in the remaining text
-    result = _extract_and_swap_entities(result, rng, num_swaps=num_swaps)
-    return result
+    """Legacy wrapper — now delegates to new Reject 2."""
+    return generate_rejected_event_substitution(chosen_answer, rng)
 
 
 def generate_rejected_structural(
@@ -721,41 +1278,8 @@ def generate_rejected_structural(
     cross_patient_gold: str,
     rng: random.Random,
 ) -> str:
-    """Create a structurally-destroyed + cross-contaminated rejected answer.
-
-    1. Split into sentences, shuffle their order
-    2. Delete 2-3 random sentences
-    3. Inject 3-5 sentences from a different patient's gold
-    """
-    # Robust sentence splitting for clinical text
-    sentences = re.split(r'(?<=[.!?])\s+|\n\n+', chosen_answer)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-
-    if len(sentences) < 6:
-        # Too short for meaningful structural destruction — use cross-patient
-        return cross_patient_gold
-
-    # 1. Shuffle all sentences
-    result_parts = list(sentences)
-    rng.shuffle(result_parts)
-
-    # 2. Delete 30-40% of sentences
-    num_del = rng.randint(max(1, len(result_parts) // 3), max(1, len(result_parts) * 2 // 5))
-    for _ in range(num_del):
-        if result_parts:
-            result_parts.pop(rng.randint(0, len(result_parts) - 1))
-
-    # 3. Inject cross-patient sentences
-    cross_sentences = re.split(r'(?<=[.!?])\s+|\n\n+', cross_patient_gold)
-    cross_sentences = [s.strip() for s in cross_sentences if len(s.strip()) > 15]
-    if cross_sentences:
-        num_inject = min(rng.randint(5, 8), len(cross_sentences))
-        injected = rng.sample(cross_sentences, num_inject)
-        for inj in injected:
-            pos = rng.randint(0, max(0, len(result_parts) - 1))
-            result_parts.insert(pos, inj.strip())
-
-    return " ".join(result_parts)
+    """Legacy wrapper — now delegates to new Reject 3."""
+    return generate_rejected_section_contamination(chosen_answer, cross_patient_gold, rng)
 
 
 def generate_rejected_by_dx_inflation(
@@ -763,76 +1287,11 @@ def generate_rejected_by_dx_inflation(
     rng: random.Random,
     inflation_factor: float = 5.0,
 ) -> str:
-    """Inflate the Diagnosis section with redundant/extraneous diagnoses.
-
-    This trains the model to prefer concise diagnosis lists over verbose ones.
-    """
-    # Split into sections
-    dx_match = re.search(r'(?:^|\n)Diagnosis:\s*\n', chosen_answer)
-    hc_match = re.search(r'(?:^|\n)Brief Hospital Course:\s*\n', chosen_answer)
-    di_match = re.search(r'(?:^|\n)Discharge Instructions:\s*\n', chosen_answer)
-
-    if not dx_match or not hc_match:
-        return generate_rejected_by_critical_deletion_and_swap(chosen_answer, rng)
-
-    dx_start = dx_match.end()
-    dx_end = hc_match.start()
-    original_dx = chosen_answer[dx_start:dx_end].strip()
-
-    # Extract individual diagnoses
-    dx_lines = [l.strip() for l in original_dx.split('\n') if l.strip()]
-    dx_items = []
-    for line in dx_lines:
-        # Remove leading numbering like "1. " or "- "
-        item = re.sub(r'^\d+\.\s*|[-•]\s*', '', line).strip()
-        if item:
-            dx_items.append(item)
-
-    if len(dx_items) < 2:
-        return generate_rejected_by_critical_deletion_and_swap(chosen_answer, rng)
-
-    # Inflate: duplicate, add generic complications, common symptoms
-    generic_extras = [
-        "Hypertension", "Hyperlipidemia", "Anemia", "Hypokalemia",
-        "Hypomagnesemia", "Hyponatremia", "Metabolic acidosis",
-        "Respiratory failure", "Acute kidney injury", "Thrombocytopenia",
-        "Leukocytosis", "Hyperglycemia", "Hypocalcemia", "Hypoalbuminemia",
-        "Electrolyte imbalance", "Dehydration", "Malnutrition",
-        "Urinary tract infection", "Pneumonia", "Sepsis",
-        "Constipation", "Anxiety", "Depression", "Insomnia",
-        "Gastroesophageal reflux disease", "Osteoarthritis",
-        "Vitamin D deficiency", "Hypothyroidism", "Atrial fibrillation",
-        "Coronary artery disease", "Chronic obstructive pulmonary disease",
-        "Peripheral vascular disease", "Deep vein thrombosis",
-        "Pulmonary embolism", "Cellulitis", "Decubitus ulcer",
-        "Failure to thrive", "Altered mental status",
-    ]
-
-    # Target: ~3× the original diagnosis count (capped by available extras)
-    target_count = min(len(dx_items) * 3, len(dx_items) + len(generic_extras))
-    target_count = max(target_count, min(len(dx_items) + 5, len(dx_items) + len(generic_extras)))
-    inflated = list(dx_items)
-    extras_pool = list(generic_extras)
-    rng.shuffle(extras_pool)
-    for extra in extras_pool:
-        if len(inflated) >= target_count:
-            break
-        if extra not in inflated:
-            inflated.append(extra)
-    rng.shuffle(inflated[1:])  # keep first Dx at top, shuffle rest
-
-    inflated_dx = "\n".join(f"{i}. {item}" for i, item in enumerate(inflated, 1))
-
-    # Rebuild answer with inflated Dx
-    result = (
-        chosen_answer[:dx_match.end()]
-        + inflated_dx + "\n\n"
-        + chosen_answer[hc_match.start():]
-    )
-    return result
+    """Legacy wrapper — now delegates to new Reject 1."""
+    return generate_rejected_numerical_temporal(chosen_answer, rng)
 
 
-# Legacy functions kept for compatibility
+# Legacy functions kept for backward compatibility
 def generate_rejected_by_deletion(
     chosen_answer: str,
     rng: random.Random,
@@ -1056,14 +1515,15 @@ def convert_ds_to_logo(
         total_critical_all += len(critical_chunks)
         total_chosen_len += len(chosen_answer)
 
-        # --- Generate rejected answers (3 types) ---
-        # reject_1: diagnosis inflation — trains against verbose diagnosis lists
-        rejected_1 = generate_rejected_by_dx_inflation(chosen_answer, rng)
-        # reject_2: delete critical-entity-rich sentences + entity swap
-        rejected_2 = generate_rejected_by_critical_deletion_and_swap(chosen_answer, rng, deletion_ratio=0.35, num_swaps=4)
-        # reject_3: structural destruction + cross-patient contamination
-        cross_pid, cross_gold = rng.choice([(p, a) for p, a in all_gold_answers.items() if p != pid])
-        rejected_3 = generate_rejected_structural(chosen_answer, cross_gold, rng)
+        # --- Generate rejected answers (3 types, v2 — balanced difficulty) ---
+        # Reject 1: numerical & temporal precision corruption
+        rejected_1 = generate_rejected_numerical_temporal(chosen_answer, rng)
+        # Reject 2: clinical event substitution & omission
+        rejected_2 = generate_rejected_event_substitution(chosen_answer, rng)
+        # Reject 3: section attribution error & cross-patient contamination
+        cross_pool = [(p, a) for p, a in all_gold_answers.items() if p != pid]
+        cross_pid, cross_gold = rng.choice(cross_pool) if cross_pool else (pid, chosen_answer)
+        rejected_3 = generate_rejected_section_contamination(chosen_answer, cross_gold, rng)
 
         # --- Build record ---
         record = {
@@ -1071,9 +1531,9 @@ def convert_ds_to_logo(
             "chunk_timestamps": chunk_timestamps,
             "combined_question": QUESTION_TEMPLATE,
             "final_answer": chosen_answer,
-            "prefix_a": rejected_1,     # diagnosis inflation
-            "suffix_a": rejected_2,     # critical deletion + entity swap
-            "tertiary_a": rejected_3,   # structural destruction + cross-patient
+            "prefix_a": rejected_1,     # numerical & temporal distortion
+            "suffix_a": rejected_2,     # event substitution & omission
+            "tertiary_a": rejected_3,   # section contamination & cross-patient
             "label": chosen_answer,
             "critical_chunks": critical_chunks,
             "partial_critical_chunks": [],

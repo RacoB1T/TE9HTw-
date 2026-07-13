@@ -115,7 +115,7 @@ Based on the clinical records above, write a complete discharge summary includin
 
 def get_prompt_template(model_path: str) -> str:
     """Auto-select prompt template based on model path."""
-    if "Llama2" in model_path or "llama-2" in model_path.lower():
+    if "Llama2" in model_path or "llama-2" in model_path.lower() or "llama2" in model_path.lower():
         return PROMPT_TEMPLATE_LLAMA2
     return PROMPT_TEMPLATE_LLAMA3
 
@@ -142,22 +142,23 @@ def chunk_events(events: List[Dict[str, str]], chunk_size: int = 300) -> List[st
 
 
 def build_prompt(events: List[Dict[str, str]], model_path: str = "", max_chunks: int = 16) -> str:
-    """Build inference prompt from clinical events."""
-    events.sort(key=lambda x: x.get("TIME", ""))
-    chunks = chunk_events(events, chunk_size=300)
-    # Take a representative sample: evenly spaced chunks
-    if len(chunks) > max_chunks:
-        step = len(chunks) / max_chunks
-        selected = [chunks[int(i * step)] for i in range(max_chunks)]
-        chunks = selected
+    """Build inference prompt from clinical events — no chunking, direct concatenation.
 
-    chunk_lines = []
-    for i, chunk in enumerate(chunks):
-        chunk_lines.append(f"[Chunk {i+1}]\n{chunk}")
-    chunks_text = "\n\n".join(chunk_lines)
+    All event texts are joined in chronological order.  No ``[Chunk N]``
+    labels are inserted, and no sampling is applied — the model sees the
+    full clinical record (truncated by the tokenizer if needed).
+    """
+    events.sort(key=lambda x: x.get("TIME", ""))
+    # Concatenate all event texts in time order
+    event_texts = []
+    for evt in events:
+        text = evt.get("TEXT", "").strip()
+        if text:
+            event_texts.append(text)
+    references_text = "\n\n".join(event_texts)
 
     template = get_prompt_template(model_path)
-    return template.format(chunks_text=chunks_text)
+    return template.format(chunks_text=references_text)
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +175,15 @@ def generate_summary(
     temperature: float = 0.1,
 ) -> str:
     """Generate a discharge summary from the prompt."""
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+    # Truncate from the LEFT to keep the most recent clinical events.
+    # Use a generous input budget so the model sees as much context as possible.
+    input_budget = 4096 - max_new_tokens - 50  # 50-token safety margin
+    tokenizer.truncation_side = "left"         # keep the END (most recent events)
+    inputs = tokenizer(
+        prompt, return_tensors="pt",
+        truncation=True, max_length=input_budget,
+        padding=False,
+    )
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     output = model.generate(
